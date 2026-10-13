@@ -1,18 +1,20 @@
 {
   "name": "chinak12-book-downloader",
   "version": "1.0.0",
-  "description": "国家中小学智慧教育平台 K12 教材可视化批量下载器与版本管理系统",
+  "description": "国家中小学智慧教育平台 K12 教材可视化批量下载器与版本管理系统 (纯 Node.js / Electron 原生实现)",
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
-    "web": "python3 server.py"
+    "server": "node server.js",
+    "dev": "node server.js"
   },
   "keywords": [
     "k12",
     "textbook",
     "smartedu",
     "downloader",
-    "electron"
+    "electron",
+    "nodejs"
   ],
   "author": "scottcheng",
   "license": "MIT",
