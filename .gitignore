@@ -1,0 +1,16 @@
+# 临时与下载缓存
+.download_temp/
+*.pdf
+*.part
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node & Electron
+node_modules/
+dist/
+.DS_Store

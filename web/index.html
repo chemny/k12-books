@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChinaK12BookDownLoader - 教材下载器</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- 顶部导航栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">📚</div>
+      <div>
+        <h1>教材下载器</h1>
+        <span class="sub">国家中小学智慧教育平台 · 电子教材</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="catalog-status" class="status-pill status-ready">目录已就绪</span>
+      <button id="btn-reindex" class="ghost-btn" title="重新从平台拉取索引">重建索引</button>
+      <button id="btn-toggle-drawer" class="primary-btn drawer-btn">
+        <span>📥 下载列表</span>
+        <span id="active-badge" class="badge">0</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- 下载根目录设置横幅 -->
+    <section class="config-banner" id="config-banner">
+      <div class="config-left">
+        <span class="config-icon">📁</span>
+        <div class="config-info">
+          <label for="input-download-dir" class="config-title">本地课本下载根目录 (China12Books)</label>
+          <div class="config-input-group">
+            <input type="text" id="input-download-dir" placeholder="例如: /Users/scottcheng/Documents/GitHub/China12Books" />
+            <button id="btn-save-dir" class="action-btn">保存并生效</button>
+            <button id="btn-audit-history" class="secondary-btn" title="检测本地已被平台移除或更新的旧教材，自动安全迁移到 History/ 镜像目录">
+              📦 历史版本审计与归档
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="config-right">
+        <div id="dir-status-pill" class="dir-pill dir-pending">未检测目录</div>
+      </div>
+    </section>
+
+    <!-- 警示条 (当未设置下载目录时提示) -->
+    <div id="dir-warning-alert" class="alert-bar alert-warning hidden">
+      ⚠️ 请先在上方设置并确认有效的下载根目录，设置后方可开启教材下载功能！
+    </div>
+
+    <!-- 筛选过滤区域 -->
+    <section class="filters-card">
+      <div class="filter-row primary-row">
+        <label class="field">
+          <span>学段</span>
+          <select id="filter-stage"><option value="">全部学段</option></select>
+        </label>
+        <label class="field">
+          <span>学科</span>
+          <select id="filter-subject"><option value="">全部学科</option></select>
+        </label>
+        <label class="field">
+          <span>版本</span>
+          <select id="filter-version"><option value="">全部版本</option></select>
+        </label>
+        <label class="field">
+          <span>年级</span>
+          <select id="filter-grade"><option value="">全部年级</option></select>
+        </label>
+      </div>
+
+      <div class="filter-row secondary-row">
+        <label class="field small-field">
+          <span>册次</span>
+          <select id="filter-volume"><option value="">全部册次</option></select>
+        </label>
+        <label class="field small-field">
+          <span>格式</span>
+          <select id="filter-format">
+            <option value="all">全部</option>
+            <option value="pdf" selected>PDF</option>
+            <option value="pptx">PowerPoint 课件</option>
+          </select>
+        </label>
+        <label class="field small-field">
+          <span>资源状态</span>
+          <select id="filter-status">
+            <option value="all">全部</option>
+            <option value="downloadable" selected>可下载</option>
+          </select>
+        </label>
+        <label class="field search-field">
+          <span>搜索书名</span>
+          <input type="text" id="filter-search" placeholder="例如: 道德与法治 一年级 或 数学" />
+        </label>
+        <button id="btn-reset-filters" class="ghost-btn reset-btn">清除筛选</button>
+      </div>
+    </section>
+
+    <!-- 统计与批量操作工具栏 -->
+    <section class="action-bar">
+      <div class="stats-summary">
+        <strong id="filtered-total" class="highlight-num">0</strong> 个资源
+        <span class="stat-tag stat-green">可下载 <b id="stat-downloadable">0</b></span>
+        <span class="stat-tag stat-purple">当前筛选匹配 <b id="stat-current-matched">0</b></span>
+      </div>
+
+      <div class="batch-controls">
+        <label class="checkbox-label">
+          <input type="checkbox" id="chk-select-page" />
+          <span>选中本页 (<span id="page-count-num">0</span>)</span>
+        </label>
+        <button id="btn-select-all-filtered" class="ghost-btn">
+          ✨ 全选筛选结果 (<span id="all-filtered-num">0</span> 本)
+        </button>
+        <button id="btn-batch-download" class="primary-btn batch-download-btn">
+          🚀 批量下载选中的教材 (<span id="selected-total-num">0</span> 本)
+        </button>
+      </div>
+    </section>
+
+    <!-- 教材列表表格 -->
+    <section class="table-container">
+      <table class="books-table">
+        <thead>
+          <tr>
+            <th width="40"><input type="checkbox" id="chk-master" /></th>
+            <th width="60">序号</th>
+            <th>名称 (含版本标记)</th>
+            <th width="260">分类目录</th>
+            <th width="160">可用文件</th>
+            <th width="100">操作</th>
+          </tr>
+        </thead>
+        <tbody id="books-tbody">
+          <tr><td colspan="6" class="loading-td">正在载入教材库与分类目录...</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- 分页控件 -->
+    <div class="pagination-bar">
+      <div class="page-info">第 <span id="cur-page-num">1</span> / <span id="total-page-num">1</span> 页</div>
+      <div class="page-btns">
+        <button id="btn-prev-page" class="ghost-btn">上一页</button>
+        <button id="btn-next-page" class="ghost-btn">下一页</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右侧抽屉：下载任务管理器 -->
+  <aside class="download-drawer hidden" id="download-drawer">
+    <div class="drawer-header">
+      <div class="drawer-title">
+        <h3>📥 下载任务列表</h3>
+        <span id="drawer-summary" class="drawer-sub">0 个任务</span>
+      </div>
+      <div class="drawer-header-actions">
+        <button id="btn-clear-completed" class="ghost-btn small-btn" title="清空已完成和已跳过的记录">清空已完成</button>
+        <button id="btn-close-drawer" class="icon-btn" title="关闭面板">✕</button>
+      </div>
+    </div>
+
+    <div class="drawer-body" id="drawer-tasks-list">
+      <div class="empty-tasks">暂无下载任务，在主界面勾选课本后点击“批量下载”即可加入队列。</div>
+    </div>
+  </aside>
+
+  <!-- 浮动弹窗提示 (Toast) -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
