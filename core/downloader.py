@@ -5,9 +5,12 @@ ChinaK12BookDownLoader 多线程下载与任务调度引擎
 功能特性：
 1. 内存任务队列与线程池调度；
 2. 实时记录单项任务进度、下载速率、剩余时间与状态；
-3. 本地同名文件（含版本号）秒级检测与跳过；
-4. 先下载至 .download_temp/ 临时目录，通过 %PDF 头部与文件大小校验后原子剪切归档；
-5. 支持 SSE 实时进度推送与取消/清空控制。
+3. 本地同名文件（含版本号）秒级检测；
+4. 若平台发布了更新版本（时间戳或内容变动）：
+   自动将本地原有文件安全剪切移至 History/ 对应镜像子目录（已存在则替换），
+   再下载最新文件落盘！
+5. 先下载至 .download_temp/ 临时目录，通过 %PDF 头部与文件大小校验后原子剪切归档；
+6. 支持 SSE 实时进度推送与取消/清空控制。
 """
 
 import os
@@ -18,6 +21,8 @@ import requests
 import threading
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Callable
+
+from core.history_archiver import archive_single_file_to_history
 
 GLOBAL_HEADERS = {
     "User-Agent": (
@@ -42,12 +47,13 @@ class TaskItem:
         self.edition_tag = book_meta.get("edition_tag", "")
         self.filename = book_meta.get("filename", "")
         self.relative_path = book_meta.get("relative_path", "")
+        self.update_time = book_meta.get("update_time", "")
         self.target_root = target_root
         self.target_full_path = str(Path(target_root) / self.relative_path)
         self.total_bytes = book_meta.get("pdf_size", 0)
         self.downloaded_bytes = 0
-        self.speed = 0.0  # bytes per second
-        self.status = "pending"  # pending, downloading, completed, skipped, failed, cancelled
+        self.speed = 0.0
+        self.status = "pending"  # pending, downloading, completed, skipped, failed, cancelled, updated
         self.error_msg = ""
         self.start_time = None
         self.finish_time = None
@@ -56,7 +62,7 @@ class TaskItem:
         pct = 0.0
         if self.total_bytes > 0:
             pct = min(100.0, (self.downloaded_bytes / self.total_bytes) * 100)
-        elif self.status == "completed":
+        elif self.status in ("completed", "updated"):
             pct = 100.0
 
         return {
@@ -93,7 +99,6 @@ class DownloadManager:
         self.session = requests.Session()
         self.session.headers.update(GLOBAL_HEADERS)
         self.event_subscribers: List[Callable[[Dict[str, Any]], None]] = []
-        self.stop_requested = False
 
     def subscribe(self, callback: Callable[[Dict[str, Any]], None]):
         self.event_subscribers.append(callback)
@@ -112,7 +117,6 @@ class DownloadManager:
             for item in book_items:
                 book_id = item["id"]
                 if book_id in self.tasks:
-                    # 如果之前已失败或已取消，可重置为 pending
                     t = self.tasks[book_id]
                     if t.status in ("failed", "cancelled"):
                         t.status = "pending"
@@ -162,18 +166,31 @@ class DownloadManager:
             self._trigger_workers()
 
     def _download_task(self, task: TaskItem):
+        target_root_path = Path(task.target_root).resolve()
         target_path = Path(task.target_full_path)
         target_dir = target_path.parent
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. 检测同名同版本文件是否存在
-        if target_path.exists() and target_path.stat().st_size > 50 * 1024:
-            task.status = "skipped"
-            task.downloaded_bytes = target_path.stat().st_size
-            return
+        # 1. 检查本地已存在文件
+        if target_path.exists():
+            local_size = target_path.stat().st_size
+            expected_size = task.total_bytes
+
+            # 如果大小吻合（允许5%误差），判定为已有最新版
+            if expected_size > 0 and abs(local_size - expected_size) <= (expected_size * 0.05):
+                task.status = "skipped"
+                task.downloaded_bytes = local_size
+                return
+            else:
+                # 平台新上传了该书（大小改变，属于新版本）
+                # 按照用户要求：旧版本直接移动到历史版本去（已存在则替换）！
+                try:
+                    archive_single_file_to_history(target_path, target_root_path)
+                except Exception as e:
+                    print(f"⚠️ 归档旧版本失败: {e}")
 
         # 2. 临时下载目录
-        temp_dir = Path(task.target_root) / ".download_temp"
+        temp_dir = target_root_path / ".download_temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_part = temp_dir / f"{task.id}.pdf.part"
         temp_finished = temp_dir / f"{task.id}.pdf"
@@ -237,7 +254,6 @@ class DownloadManager:
                                 written += len(chunk)
                                 task.downloaded_bytes = written
 
-                                # 计算速率
                                 now = time.time()
                                 dt = now - last_time
                                 if dt >= 0.5:
@@ -249,7 +265,6 @@ class DownloadManager:
                             temp_part.unlink(missing_ok=True)
                             continue
 
-                        # 下载完成，原子移动
                         temp_part.replace(temp_finished)
                         shutil.move(str(temp_finished), str(target_path))
 
@@ -277,7 +292,7 @@ class DownloadManager:
 
     def clear_completed(self):
         with self.lock:
-            to_remove = [tid for tid in self.task_order if self.tasks[tid].status in ("completed", "skipped")]
+            to_remove = [tid for tid in self.task_order if self.tasks[tid].status in ("completed", "skipped", "updated")]
             for tid in to_remove:
                 del self.tasks[tid]
                 self.task_order.remove(tid)

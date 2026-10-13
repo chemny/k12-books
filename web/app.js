@@ -1,4 +1,4 @@
-// ChinaK12BookDownLoader 现代化前端交互引擎
+// ChinaK12BookDownLoader 现代化前端交互引擎 (以官方最新为准)
 
 let allBooks = [];
 let filteredBooks = [];
@@ -67,7 +67,6 @@ async function loadConfig() {
     const cfg = await res.json();
     currentDownloadDir = cfg.download_dir || "";
     elInputDownloadDir.value = currentDownloadDir;
-
     updateDirStatus(cfg.exists && currentDownloadDir.length > 0);
   } catch (e) {
     console.error("加载配置失败:", e);
@@ -88,15 +87,16 @@ function updateDirStatus(isReady) {
   }
 }
 
-// 2. 加载教材数据与维度
+// 2. 加载教材数据与维度 (默认只选官方最新在用版)
 async function loadCatalog() {
   try {
-    elCatalogStatus.textContent = "正在拉取目录...";
+    elCatalogStatus.textContent = "正在载入目录...";
     const res = await fetch("/api/catalog");
     const data = await res.json();
 
     allBooks = data.books || [];
-    elCatalogStatus.textContent = `✅ 目录已就绪 (${allBooks.length.toLocaleString()} 资源)`;
+    const activeCount = allBooks.filter(b => b.has_pdf && b.is_active).length;
+    elCatalogStatus.textContent = `✅ 目录已就绪 (${activeCount.toLocaleString()} 本最新教材)`;
 
     populateDropdown(elFilterStage, data.dimensions.stages);
     populateDropdown(elFilterSubject, data.dimensions.subjects);
@@ -120,7 +120,7 @@ function populateDropdown(selectEl, items) {
   });
 }
 
-// 3. 筛选过滤
+// 3. 筛选过滤 (默认以官网最新在用为准，排除过时重复件)
 function applyFilters() {
   const stage = elFilterStage.value;
   const subject = elFilterSubject.value;
@@ -132,6 +132,9 @@ function applyFilters() {
   const search = elFilterSearch.value.trim().toLowerCase();
 
   filteredBooks = allBooks.filter(book => {
+    // 核心改进：以官方最新在用为准，自动折叠旧重复条目
+    if (!book.is_active) return false;
+
     if (stage && book.stage !== stage) return false;
     if (subject && book.subject !== subject) return false;
     if (version && book.version !== version) return false;
@@ -205,6 +208,7 @@ function renderTable() {
         <td class="book-title-cell">
           ${escapeHtml(book.clean_title || book.title)}
           ${editionTagHtml}
+          <span style="font-size:11px;color:#38bdf8;background:rgba(56,189,248,0.1);padding:1px 5px;border-radius:4px;margin-left:4px;">最新在用</span>
         </td>
         <td class="category-cell">
           ${escapeHtml(book.stage)} · ${escapeHtml(book.subject)} · ${escapeHtml(book.publisher_dir)} · ${escapeHtml(book.grade)}
@@ -247,7 +251,6 @@ function renderTable() {
 
 // 5. 事件监听器
 function setupEventListeners() {
-  // 筛选器变动
   [elFilterStage, elFilterSubject, elFilterVersion, elFilterGrade, elFilterVolume, elFilterFormat, elFilterStatus].forEach(el => {
     el.addEventListener("change", applyFilters);
   });
@@ -291,19 +294,19 @@ function setupEventListeners() {
     }
   });
 
-  // 历史版本审计与归档
+  // 历史版本审计与归档 (若已存在则替换)
   elBtnAuditHistory.addEventListener("click", async () => {
     if (!currentDownloadDir) {
       showToast("⚠️ 请先设置下载根目录");
       return;
     }
-    showToast("🔍 正在扫描核对本地教材与云端最新版本...");
+    showToast("🔍 正在比对本地教材与平台最新版本，扫描下架旧版...");
     try {
       const res = await fetch("/api/audit_history", { method: "POST" });
       const data = await res.json();
       if (data.success) {
         if (data.archived_count > 0) {
-          showToast(`📦 审计完成！已将 ${data.archived_count} 个历史旧版文件安全归档至 History/ 目录`);
+          showToast(`📦 审计完成！已将 ${data.archived_count} 个历史旧版文件安全归档至 History/ 对应目录（存在已自动替换）`);
         } else {
           showToast("✨ 审计完成！本地所有教材均为当前最新版本，未发现需归档的旧版文件。");
         }
@@ -330,14 +333,14 @@ function setupEventListeners() {
   elChkSelectPage.addEventListener("change", e => togglePageSelection(e.target.checked));
   elChkMaster.addEventListener("change", e => togglePageSelection(e.target.checked));
 
-  // 全选当前筛选出的所有结果
+  // 全选当前筛选出的所有最新教材
   elBtnSelectAllFiltered.addEventListener("click", () => {
     filteredBooks.forEach(b => {
       if (b.has_pdf) selectedBookIds.add(b.id);
     });
     renderTable();
     updateStats();
-    showToast(`✅ 已全选当前筛选出的全部 ${selectedBookIds.size} 本可下载教材！`);
+    showToast(`✅ 已全选当前筛选出的全部 ${selectedBookIds.size} 本最新在用教材！`);
   });
 
   // 批量下载
@@ -387,7 +390,7 @@ async function triggerDownload(bookIds) {
   }
 
   showToast(`🚀 正在提交 ${bookIds.length} 本教材至下载队列...`);
-  elDownloadDrawer.classList.remove("hidden"); // 立即滑出抽屉，给用户明确反馈
+  elDownloadDrawer.classList.remove("hidden");
 
   try {
     const res = await fetch("/api/download", {
@@ -418,9 +421,6 @@ function initSSE() {
       }
     } catch (e) {}
   };
-  sse.onerror = () => {
-    // 自动重连
-  };
 }
 
 function refreshTasksList() {
@@ -445,6 +445,9 @@ function refreshTasksList() {
       statusBadgeClass = "task-status-downloading";
     } else if (task.status === "completed") {
       statusText = "已归档";
+      statusBadgeClass = "task-status-completed";
+    } else if (task.status === "updated") {
+      statusText = "已更新(旧版归档)";
       statusBadgeClass = "task-status-completed";
     } else if (task.status === "skipped") {
       statusText = "已存在(跳过)";
@@ -478,7 +481,6 @@ function refreshTasksList() {
   elDrawerTasksList.innerHTML = html;
 }
 
-// 辅助函数
 function showToast(msg) {
   const container = document.getElementById("toast-container");
   const t = document.createElement("div");

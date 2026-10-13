@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-ChinaK12BookDownLoader 核心目录分类与版本标注引擎
+ChinaK12BookDownLoader 核心目录分类、版本标注与最新在用优选引擎
 =============================================================
-负责加载与解析平台 3565 本教材，提取规范的学段、学科、出版社、年级，
-并为每本书生成精确的版本号标签（如 [2024修订版]、[2022修订版]）及相对存储路径。
+负责加载与解析平台 3565 本教材，提取规范的学段、学科、出版社、年级、版本标签，
+并自动对同名同分类的多版本（如 #101 与 #3528）进行时间比对，智能优选官方当前最新在用版！
 """
 
 import os
@@ -45,6 +45,7 @@ PUBLISHER_MAPPING = {
 }
 
 CACHE_INDEX_PATH = Path.home() / "Library/Caches/textbook-downloader/web_index.json"
+ASSET_INDEX_PATH = Path.home() / "Library/Caches/textbook-downloader/asset_index.json"
 
 
 def extract_edition_tag(title: str, book_meta: Optional[Dict[str, Any]] = None) -> str:
@@ -91,14 +92,30 @@ def clean_book_title(title: str) -> str:
     return clean
 
 
-def resolve_book_item(book: Dict[str, Any]) -> Dict[str, Any]:
-    """解析单本书的规范化分类与目标路径"""
+def load_update_time_map() -> Dict[str, str]:
+    """从 asset_index.json 加载每本书精确的 update_time"""
+    time_map = {}
+    if ASSET_INDEX_PATH.exists():
+        try:
+            with open(ASSET_INDEX_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for b in data.get("books", []):
+                    if b.get("id"):
+                        time_map[b["id"]] = b.get("update_time", "")
+        except Exception:
+            pass
+    return time_map
+
+
+def resolve_book_item(book: Dict[str, Any], time_map: Dict[str, str]) -> Dict[str, Any]:
+    """解析单本书的规范化分类、版本与时间戳"""
     raw_stage = (book.get("stage") or ["未标注"])[0]
     raw_subject = (book.get("subject") or ["未标注"])[0]
     raw_version = (book.get("version") or ["未标注"])[0]
     raw_grade = (book.get("grade") or ["全一册"])[0]
     raw_volume = (book.get("volume") or [""])[0]
     title = book.get("title", "")
+    book_id = book.get("id", "")
 
     # 学段规范化
     stage = raw_stage
@@ -129,8 +146,11 @@ def resolve_book_item(book: Dict[str, Any]) -> Dict[str, Any]:
     if raw_grade in ("未标注", "全一册") and raw_volume:
         grade_dir = raw_volume
 
+    # 获取更新时间戳
+    update_time = time_map.get(book_id) or book.get("update_time", "")
+
     # 版本号提取
-    edition_tag = extract_edition_tag(title, book)
+    edition_tag = extract_edition_tag(title, {"update_time": update_time})
 
     # 规范化文件名 (带版本标签)
     base_name = clean_book_title(title)
@@ -149,7 +169,7 @@ def resolve_book_item(book: Dict[str, Any]) -> Dict[str, Any]:
     pdf_size = formats.get("pdf", 0)
 
     return {
-        "id": book.get("id"),
+        "id": book_id,
         "seq": book.get("seq", 0),
         "title": title,
         "clean_title": base_name,
@@ -167,45 +187,86 @@ def resolve_book_item(book: Dict[str, Any]) -> Dict[str, Any]:
         "pdf_size": pdf_size,
         "has_pptx": "pptx" in formats,
         "pptx_size": formats.get("pptx", 0),
+        "update_time": update_time,
         "formats": formats,
+        "is_active": True,  # 默认在用，后续去重逻辑计算
+        "is_latest_official": True,
     }
 
 
+def deduplicate_and_pick_latest(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    针对同年级、同学科、同版本、同名的重复课本（164对记录）：
+    比对 update_time / seq，智能选出官网当前在用的最新一本标记为 is_active = True，
+    较老的副本标记为 is_active = False，并在界面与下载队列中以最新为准！
+    """
+    groups: Dict[Tuple[str, str, str, str, str], List[Dict[str, Any]]] = {}
+    for b in books:
+        if not b["has_pdf"]:
+            continue
+        # 分组标识: (学段, 学科, 出版社, 年级, 规范化书名)
+        key = (b["stage"], b["subject"], b["publisher_dir"], b["grade"], b["clean_title"])
+        groups.setdefault(key, []).append(b)
+
+    for key, items in groups.items():
+        if len(items) <= 1:
+            continue
+
+        # 存在多版本！按更新时间排序（若无更新时间则按序号 seq，序号大的是 catalog 4 后期录入的最新版）
+        items.sort(key=lambda x: (x.get("update_time") or "", x.get("seq", 0)), reverse=True)
+
+        # 最新的为当前官方在用
+        latest_item = items[0]
+        latest_item["is_active"] = True
+        latest_item["is_latest_official"] = True
+
+        # 其他旧版本标记为已被替代
+        for older in items[1:]:
+            older["is_active"] = False
+            older["is_latest_official"] = False
+            older["superseded_by"] = latest_item["id"]
+
+    return books
+
+
 def load_catalog_data() -> Dict[str, Any]:
-    """加载全部教材数据并构建过滤树选项"""
-    books = []
+    """加载全部教材数据并构建过滤树选项（智能优选最新在用版）"""
+    raw_books = []
     if CACHE_INDEX_PATH.exists():
         try:
             with open(CACHE_INDEX_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                books = data.get("books", [])
+                raw_books = data.get("books", [])
         except Exception as e:
             print(f"⚠️ 读取缓存失败: {e}")
 
-    resolved_books = [resolve_book_item(b) for b in books]
+    time_map = load_update_time_map()
+    resolved_books = [resolve_book_item(b, time_map) for b in raw_books]
+    resolved_books = deduplicate_and_pick_latest(resolved_books)
 
-    # 构建维度选项字典
+    # 统计数据
+    active_pdf_books = [b for b in resolved_books if b["has_pdf"] and b["is_active"]]
+
     stages = set()
     subjects = set()
     versions = set()
     grades = set()
     volumes = set()
 
-    for item in resolved_books:
-        if item["has_pdf"]:
-            stages.add(item["stage"])
-            subjects.add(item["subject"])
-            if item["version"] != "未标注":
-                versions.add(item["version"])
-            if item["grade"] != "未标注":
-                grades.add(item["grade"])
-            if item["volume"]:
-                volumes.add(item["volume"])
+    for item in active_pdf_books:
+        stages.add(item["stage"])
+        subjects.add(item["subject"])
+        if item["version"] != "未标注":
+            versions.add(item["version"])
+        if item["grade"] != "未标注":
+            grades.add(item["grade"])
+        if item["volume"]:
+            volumes.add(item["volume"])
 
     stats = {
         "total": len(resolved_books),
-        "downloadable_pdf": sum(1 for b in resolved_books if b["has_pdf"]),
-        "has_pptx": sum(1 for b in resolved_books if b["has_pptx"]),
+        "downloadable_pdf": len(active_pdf_books),
+        "duplicates_filtered": len([b for b in resolved_books if b["has_pdf"] and not b["is_active"]]),
     }
 
     return {
