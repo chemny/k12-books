@@ -1,7 +1,21 @@
-// Electron 桌面主进程窗口入口 (纯原生 JavaScript 实现，零 Python 依赖)
-const { app, BrowserWindow, dialog } = require("electron");
+// Electron 桌面主进程窗口入口
+const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const path = require("path");
 const { runServer, server, DOWNLOAD_MANAGER } = require("../server");
+
+// 处理渲染进程请求打开本地文件夹选择对话框
+ipcMain.handle("select-directory", async (event, defaultPath) => {
+  const win = BrowserWindow.getFocusedWindow() || mainWindow;
+  const res = await dialog.showOpenDialog(win, {
+    title: "选择教材下载保存目录",
+    defaultPath: defaultPath || undefined,
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (res.canceled || !res.filePaths || res.filePaths.length === 0) {
+    return null;
+  }
+  return res.filePaths[0];
+});
 
 let mainWindow;
 let activePort = 8080;
@@ -14,11 +28,13 @@ function createWindow(port = 8080) {
     minWidth: 1024,
     minHeight: 700,
     title: "ChinaK12BookDownLoader - 国家智慧教育平台教材下载器",
+    icon: path.join(__dirname, "../build/icon.png"),
     backgroundColor: "#0c0d12",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       nodeIntegration: false,
       contextIsolation: true,
+      defaultEncoding: "utf-8",
     },
   });
 

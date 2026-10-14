@@ -1,19 +1,260 @@
-// 纯 Node.js / JavaScript 实现：低并发稳定下载、持久化、暂停/恢复、断点续传与失败隔离引擎
+// 低并发稳定下载、持久化、暂停/恢复、断点续传与失败隔离引擎
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const https = require('https');
 const { exec } = require('child_process');
-const { archiveSingleFileToHistory } = require('./historyArchiver');
+const { customDnsLookup } = require('./dnsResolver');
+
+function archiveSingleFileToHistory(sourceFile, rootPath) {
+  const relPath = path.relative(rootPath, sourceFile);
+  const historyTarget = path.join(rootPath, 'History', relPath);
+  const historyDir = path.dirname(historyTarget);
+
+  fs.mkdirSync(historyDir, { recursive: true });
+
+  if (fs.existsSync(historyTarget)) {
+    fs.unlinkSync(historyTarget);
+  }
+
+  try {
+    fs.renameSync(sourceFile, historyTarget);
+  } catch (err) {
+    if (err.code === 'EXDEV') {
+      fs.copyFileSync(sourceFile, historyTarget);
+      fs.unlinkSync(sourceFile);
+    } else {
+      throw err;
+    }
+  }
+
+  return historyTarget;
+}
 
 const GLOBAL_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Referer': 'https://basic.smartedu.cn/',
   'Origin': 'https://basic.smartedu.cn',
-  'Accept': 'application/json, text/plain, */*',
+  'Accept': '*/*',
   'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-  'Authorization': 'Bearer 0',
-  'X-ND-AUTH': 'MAC id="0",nonce="0",mac="0"',
 };
+
+const FLAG_PRIORITY = { source: 0, pdf: 1, pptx: 1 };
+
+function pickBestPdfItem(items) {
+  const candidates = (items || []).filter(it => {
+    const fmt = (it.ti_format || '').toLowerCase();
+    const storages = it.ti_storages || (it.ti_storage ? [it.ti_storage] : []);
+    return fmt === 'pdf' && storages.length > 0;
+  });
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    const prioA = FLAG_PRIORITY[a.ti_file_flag] !== undefined ? FLAG_PRIORITY[a.ti_file_flag] : 9;
+    const prioB = FLAG_PRIORITY[b.ti_file_flag] !== undefined ? FLAG_PRIORITY[b.ti_file_flag] : 9;
+    if (prioA !== prioB) return prioA - prioB;
+    return (b.ti_size || 0) - (a.ti_size || 0); // 优先高画质完整版
+  });
+  return candidates[0];
+}
+
+function requestJson(urlStr, options = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const signal = options.signal;
+    if (signal && signal.aborted) {
+      return reject(new Error('AbortError'));
+    }
+
+    const req = https.request({
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers: {
+        ...GLOBAL_HEADERS,
+        'Accept': 'application/json, text/plain, */*',
+        ...(options.headers || {})
+      },
+      lookup: customDnsLookup,
+      timeout: options.timeout || 12000,
+    }, (res) => {
+      let raw = '';
+      res.setEncoding('utf8');
+      res.on('data', c => raw += c);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(new Error(`Invalid JSON: ${e.message}`));
+          }
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}`));
+        }
+      });
+    });
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        req.destroy();
+        reject(new Error('AbortError'));
+      }, { once: true });
+    }
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function streamDownloadToFile({
+  urlStr,
+  tempPartPath,
+  existingBytes,
+  signal,
+  onProgress,
+  connectTimeoutMs = 12000,
+  idleTimeoutMs = 30000,
+}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    if (signal && signal.aborted) {
+      return reject(new Error('AbortError'));
+    }
+
+    const headers = {
+      ...GLOBAL_HEADERS,
+      'Host': u.hostname,
+    };
+
+    let isResume = false;
+    if (existingBytes > 4) {
+      headers['Range'] = `bytes=${existingBytes}-`;
+      isResume = true;
+    }
+
+    let fileWriteStream = null;
+    let timer = null;
+
+    const resetIdleTimer = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Stream idle timeout'));
+      }, idleTimeoutMs);
+    };
+
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (fileWriteStream) {
+        try { fileWriteStream.destroy(); } catch (e) {}
+      }
+    };
+
+    const req = https.request({
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers,
+      lookup: customDnsLookup,
+      timeout: connectTimeoutMs,
+    }, (res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        cleanup();
+        return reject(new Error(`官方限制 (HTTP ${res.statusCode})`));
+      }
+      if (res.statusCode !== 200 && res.statusCode !== 206) {
+        cleanup();
+        return reject(new Error(`CDN 节点异常 (HTTP ${res.statusCode})`));
+      }
+
+      let totalBytes = 0;
+      const contentLen = res.headers['content-length'];
+      if (contentLen) {
+        const len = parseInt(contentLen, 10);
+        totalBytes = (res.statusCode === 206) ? (existingBytes + len) : len;
+      }
+
+      const fileFlags = (res.statusCode === 206) ? 'a' : 'w';
+      let written = (res.statusCode === 206) ? existingBytes : 0;
+      fileWriteStream = fs.createWriteStream(tempPartPath, { flags: fileFlags });
+
+      let isFirstChunk = (written === 0);
+      let isValidPdf = true;
+
+      resetIdleTimer();
+
+      res.on('data', (chunk) => {
+        resetIdleTimer();
+
+        if (signal && signal.aborted) {
+          cleanup();
+          req.destroy();
+          return reject(new Error('AbortError'));
+        }
+
+        if (isFirstChunk) {
+          isFirstChunk = false;
+          // 校验 %PDF 魔数 (0x25 0x50 0x44 0x46)
+          if (chunk.length >= 4) {
+            if (chunk[0] !== 0x25 || chunk[1] !== 0x50 || chunk[2] !== 0x44 || chunk[3] !== 0x46) {
+              isValidPdf = false;
+              cleanup();
+              req.destroy();
+              return reject(new Error('Invalid PDF magic header'));
+            }
+          }
+        }
+
+        fileWriteStream.write(chunk);
+        written += chunk.length;
+        if (onProgress) {
+          onProgress(written, totalBytes);
+        }
+      });
+
+      res.on('end', () => {
+        if (timer) clearTimeout(timer);
+        fileWriteStream.end(() => {
+          if (!isValidPdf || written < 20 * 1024) {
+            return reject(new Error('File incomplete or invalid'));
+          }
+          resolve({ written, totalBytes });
+        });
+      });
+
+      res.on('error', (err) => {
+        cleanup();
+        reject(err);
+      });
+    });
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        cleanup();
+        req.destroy();
+        reject(new Error('AbortError'));
+      }, { once: true });
+    }
+
+    req.on('timeout', () => {
+      cleanup();
+      req.destroy();
+      reject(new Error('Connection timeout'));
+    });
+
+    req.on('error', (err) => {
+      cleanup();
+      reject(err);
+    });
+
+    req.end();
+  });
+}
 
 const TASKS_STORAGE_FILE = path.join(os.homedir(), '.chinak12_downloader_tasks.json');
 
@@ -200,43 +441,80 @@ class DownloadManager {
     return added;
   }
 
-  triggerWorkers() {
-    while (this.activeWorkers < this.maxWorkers) {
-      let pendingTask = null;
-      for (const tid of this.taskOrder) {
-        const t = this.tasks.get(tid);
-        if (t && t.status === 'pending') {
-          pendingTask = t;
-          break;
-        }
-      }
+  hasPendingTasks() {
+    for (const tid of this.taskOrder) {
+      const t = this.tasks.get(tid);
+      if (t && t.status === 'pending') return true;
+    }
+    return false;
+  }
 
-      if (!pendingTask) {
+  _pickNextPendingTask() {
+    for (const tid of this.taskOrder) {
+      const t = this.tasks.get(tid);
+      if (t && t.status === 'pending') return t;
+    }
+    return null;
+  }
+
+  triggerWorkers() {
+    this.maxWorkers = 2; // 严苛硬锁为 2，绝对杜绝任何超额并发
+    while (this.activeWorkers < this.maxWorkers) {
+      if (!this.hasPendingTasks()) {
         break;
       }
-
-      pendingTask.status = 'downloading';
-      pendingTask.start_time = Date.now();
-      pendingTask.abortController = new AbortController();
       this.activeWorkers++;
+      const workerIndex = this.activeWorkers;
+      console.log(`⚡ [Worker调度] 启动第 ${workerIndex} 个 Worker (上限: ${this.maxWorkers})`);
+      this._runWorkerLoop(workerIndex).catch(err => {
+        console.error('Worker loop exception:', err);
+      });
+    }
+  }
 
-      // 任务启动轻微抖动延迟，防并发冲击 CDN
-      setTimeout(() => {
-        this.downloadTask(pendingTask)
-          .catch(err => {
-            if (pendingTask.status !== 'paused') {
-              pendingTask.status = 'failed';
-              pendingTask.error_msg = err.message || String(err);
-            }
-          })
-          .finally(() => {
-            pendingTask.abortController = null;
-            this.activeWorkers--;
-            this.saveToStorage();
-            this.notify('task_finished', pendingTask.toDict());
-            this.triggerWorkers();
-          });
-      }, 200);
+  async _runWorkerLoop(workerIndex = 1) {
+    try {
+      // 错峰启动防护：如果是第 2 个 Worker，轻微错开 400ms 建立握手，避免同时冲击 CDN
+      if (workerIndex > 1) {
+        await new Promise(r => setTimeout(r, 400));
+      }
+
+      while (true) {
+        const task = this._pickNextPendingTask();
+        if (!task) {
+          break; // 没有任务了，本 worker 正常退出
+        }
+
+        task.status = 'downloading';
+        task.start_time = Date.now();
+        task.abortController = new AbortController();
+        console.log(`🚀 [下载开始] 《${task.filename}》 (活跃Worker: ${this.activeWorkers}/${this.maxWorkers})`);
+        this.saveToStorage();
+        this.notify('task_started', task.toDict());
+
+        try {
+          await this.downloadTask(task);
+        } catch (err) {
+          if (task.status !== 'paused') {
+            task.status = 'failed';
+            task.error_msg = err.message || String(err);
+          }
+        } finally {
+          task.abortController = null;
+          this.saveToStorage();
+          this.notify('task_finished', task.toDict());
+          // 上下任务之间礼貌休眠防护：800ms~1200ms 动态随机抖动，彻底规避 CDN 机械化频控与封锁
+          const jitterDelay = 800 + Math.floor(Math.random() * 400);
+          await new Promise(r => setTimeout(r, jitterDelay));
+        }
+      }
+    } finally {
+      this.activeWorkers--;
+      console.log(`⏹️ [Worker释放] 剩余活跃Worker: ${this.activeWorkers}`);
+      // 若还有剩余待下载任务，唤醒新 worker
+      if (this.hasPendingTasks()) {
+        this.triggerWorkers();
+      }
     }
   }
 
@@ -277,21 +555,19 @@ class DownloadManager {
     const detailsUrls = [
       `https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${task.id}.json`,
       `https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${task.id}.json`,
+      `https://s-file-3.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${task.id}.json`,
     ];
 
     for (const dUrl of detailsUrls) {
       if (task.status === 'paused') return;
       try {
-        const dRes = await fetch(dUrl, {
-          headers: GLOBAL_HEADERS,
-          signal: task.abortController ? task.abortController.signal : AbortSignal.timeout(15000),
+        detailsData = await requestJson(dUrl, {
+          signal: task.abortController ? task.abortController.signal : null,
+          timeout: 10000,
         });
-        if (dRes.ok) {
-          detailsData = await dRes.json();
-          break;
-        }
+        if (detailsData) break;
       } catch (e) {
-        if (e.name === 'AbortError') return;
+        if (e.message === 'AbortError') return;
       }
     }
 
@@ -302,16 +578,31 @@ class DownloadManager {
     }
 
     const items = detailsData.ti_items || [];
-    const pdfItem = items.find(it => it.ti_format === 'pdf');
+    const pdfItem = pickBestPdfItem(items);
     if (!pdfItem) {
       task.status = 'failed';
       task.error_msg = '官方未发布有效 PDF';
       return;
     }
 
-    let candidateUrls = pdfItem.ti_storages || [];
-    if (candidateUrls.length === 0 && pdfItem.ti_storage) {
-      candidateUrls = [pdfItem.ti_storage.replace('cs_path:${ref-path}', 'https://r1-ndr-private.ykt.cbern.com.cn')];
+    let rawStorages = pdfItem.ti_storages || [];
+    if (rawStorages.length === 0 && pdfItem.ti_storage) {
+      rawStorages = [pdfItem.ti_storage.replace('cs_path:${ref-path}', 'https://r1-ndr-private.ykt.cbern.com.cn')];
+    }
+
+    // 核心对齐原作者算法: 将 *-ndr-private 扩展为公开镜像 *-ndr-oversea (匿名可用)，再 fallback 回原始镜像
+    const candidateUrls = [];
+    for (const storage of rawStorages) {
+      const candidates = [
+        storage.replace('-ndr-private', '-ndr-oversea'),
+        storage
+      ];
+      for (const cand of candidates) {
+        const encoded = encodeURI(cand);
+        if (!candidateUrls.includes(encoded)) {
+          candidateUrls.push(encoded);
+        }
+      }
     }
 
     if (candidateUrls.length === 0) {
@@ -329,92 +620,31 @@ class DownloadManager {
     }
 
     let downloadOk = false;
+    let lastErrorReason = '';
     for (const url of candidateUrls) {
-      if (task.status === 'paused') return;
+      if (task.status !== 'downloading') return;
 
       try {
-        const fetchHeaders = { ...GLOBAL_HEADERS };
-        let isResume = false;
+        let lastSpeedTime = Date.now();
+        let lastSpeedBytes = existingBytes;
 
-        // 如果本地已有部分分块且大于 4 字节（且符合 %PDF），尝试 Range 续传
-        if (existingBytes > 4) {
-          fetchHeaders['Range'] = `bytes=${existingBytes}-`;
-          isResume = true;
-        }
-
-        const streamResp = await fetch(url, {
-          headers: fetchHeaders,
-          signal: task.abortController ? task.abortController.signal : AbortSignal.timeout(180000),
-        });
-
-        if (streamResp.status !== 200 && streamResp.status !== 206) {
-          continue;
-        }
-
-        const contentLen = streamResp.headers.get('content-length');
-        if (contentLen) {
-          const len = parseInt(contentLen, 10);
-          task.total_bytes = isResume ? (existingBytes + len) : len;
-        }
-
-        // 打开写入流 (如果是 206 部分内容则追加 'a'，否则重新覆盖 'w')
-        const fileFlags = (streamResp.status === 206) ? 'a' : 'w';
-        if (fileFlags === 'w') {
-          existingBytes = 0;
-        }
-
-        const reader = streamResp.body.getReader();
-        const fileWriteStream = fs.createWriteStream(tempPart, { flags: fileFlags });
-
-        let written = existingBytes;
-        task.downloaded_bytes = written;
-        let isFirst = (existingBytes === 0);
-        let isValidPdf = true;
-        let lastTime = Date.now();
-        let lastWritten = written;
-
-        while (true) {
-          if (task.status === 'paused') {
-            fileWriteStream.destroy();
-            return;
-          }
-
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          if (isFirst) {
-            isFirst = false;
-            // 校验 %PDF 魔数 (0x25 0x50 0x44 0x46)
-            if (value.length >= 4) {
-              if (value[0] !== 0x25 || value[1] !== 0x50 || value[2] !== 0x44 || value[3] !== 0x46) {
-                isValidPdf = false;
-                break;
-              }
+        const res = await streamDownloadToFile({
+          urlStr: url,
+          tempPartPath: tempPart,
+          existingBytes: existingBytes,
+          signal: task.abortController ? task.abortController.signal : null,
+          onProgress: (downloaded, total) => {
+            task.downloaded_bytes = downloaded;
+            if (total > 0) task.total_bytes = total;
+            const now = Date.now();
+            const dt = (now - lastSpeedTime) / 1000;
+            if (dt >= 0.5) {
+              task.speed = Math.max(0, (downloaded - lastSpeedBytes) / dt);
+              lastSpeedTime = now;
+              lastSpeedBytes = downloaded;
             }
           }
-
-          fileWriteStream.write(Buffer.from(value));
-          written += value.length;
-          task.downloaded_bytes = written;
-
-          const now = Date.now();
-          const dt = (now - lastTime) / 1000;
-          if (dt >= 0.5) {
-            task.speed = (written - lastWritten) / dt;
-            lastTime = now;
-            lastWritten = written;
-          }
-        }
-
-        await new Promise((resolve, reject) => {
-          fileWriteStream.end(() => resolve());
-          fileWriteStream.on('error', reject);
         });
-
-        if (!isValidPdf || written < 20 * 1024) {
-          if (fs.existsSync(tempPart)) fs.unlinkSync(tempPart);
-          continue;
-        }
 
         // 下载完成，原子归档到目标位置
         if (fs.existsSync(tempFinished)) fs.unlinkSync(tempFinished);
@@ -432,20 +662,33 @@ class DownloadManager {
           }
         }
 
-        downloadOk = true;
         task.status = 'completed';
-        task.downloaded_bytes = written;
+        task.speed = 0;
+        task.error_msg = '';
+        task.downloaded_bytes = res.written;
+        task.total_bytes = res.written;
         task.finish_time = Date.now();
+        downloadOk = true;
+        console.log(`✅ [下载完成] 《${task.filename}》 (${Math.round(res.written / 1024 / 1024 * 10) / 10} MB)`);
         break;
       } catch (err) {
-        if (task.status === 'paused') return;
+        if (task.status === 'paused' || (task.abortController && task.abortController.signal.aborted)) {
+          return;
+        }
+        lastErrorReason = err.message || String(err);
+        if (lastErrorReason.includes('Invalid PDF magic header')) {
+          try { if (fs.existsSync(tempPart)) fs.unlinkSync(tempPart); } catch (e) {}
+          existingBytes = 0;
+        }
+        console.warn(`⚠️ [镜像重试] 《${task.filename}》: ${lastErrorReason}`);
+        await new Promise(r => setTimeout(r, 200));
         continue;
       }
     }
 
-    if (!downloadOk && task.status !== 'paused') {
+    if (!downloadOk && task.status === 'downloading') {
       task.status = 'failed';
-      task.error_msg = '所有 CDN 节点连接超时或拒绝 (请稍后重试)';
+      task.error_msg = lastErrorReason || '所有 CDN 节点连接超时或拒绝 (请稍后重试)';
     }
   }
 
@@ -612,19 +855,31 @@ class DownloadManager {
     return toRemove.length;
   }
 
-  // --- 打开文件与所在目录 ---
+  // --- 打开文件与所在目录 (支持 macOS, Windows, Linux) ---
   openItemInFolder(taskId) {
     const t = this.tasks.get(taskId);
     if (!t) return false;
     const fullPath = t.target_full_path;
     if (fs.existsSync(fullPath)) {
-      exec(`open -R "${fullPath}"`);
+      if (process.platform === 'darwin') {
+        exec(`open -R "${fullPath}"`);
+      } else if (process.platform === 'win32') {
+        exec(`explorer.exe /select,"${fullPath.replace(/\//g, '\\')}"`);
+      } else {
+        exec(`xdg-open "${path.dirname(fullPath)}"`);
+      }
       return true;
     } else {
       // 若文件不存在，尝试打开其所在目录
       const dir = path.dirname(fullPath);
       if (fs.existsSync(dir)) {
-        exec(`open "${dir}"`);
+        if (process.platform === 'darwin') {
+          exec(`open "${dir}"`);
+        } else if (process.platform === 'win32') {
+          exec(`explorer.exe "${dir.replace(/\//g, '\\')}"`);
+        } else {
+          exec(`xdg-open "${dir}"`);
+        }
         return true;
       }
     }

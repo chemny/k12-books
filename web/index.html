@@ -18,10 +18,17 @@
     </div>
     <div class="topbar-right">
       <span id="catalog-status" class="status-pill status-ready">目录已就绪</span>
-      <button id="btn-reindex" class="ghost-btn" title="重新从平台拉取索引">重建索引</button>
-      <button id="btn-toggle-drawer" class="primary-btn drawer-btn">
+      <span style="font-size:12px;color:#a5b4fc;background:#1e1b4b;border:1px solid #4338ca;padding:3px 8px;border-radius:6px;font-weight:500;">⚡ 严格限并发: 2</span>
+      <button id="btn-fetch-latest" class="ghost-btn fetch-btn" title="从国家中小学智慧教育平台同步获取最新教材信息">🔄 获取最新教材信息</button>
+      <button id="btn-toggle-drawer" class="primary-btn drawer-btn" title="查看下载管理器 (正在下载 / 失败 / 已完成)">
         <span>📥 下载列表</span>
-        <span id="active-badge" class="badge">0</span>
+        <span class="dl-badge-group">
+          (<span id="badge-dl-running" class="dl-num-running" title="正在下载（含下载中、排队中、暂停）">0</span>
+          <span class="dl-badge-slash">/</span>
+          <span id="badge-dl-failed" class="dl-num-failed" title="失败任务数">0</span>
+          <span class="dl-badge-slash">/</span>
+          <span id="badge-dl-completed" class="dl-num-completed" title="已完成任务数">0</span>)
+        </span>
       </button>
     </div>
   </header>
@@ -34,11 +41,8 @@
         <div class="config-info">
           <label for="input-download-dir" class="config-title">本地课本下载根目录 (China12Books)</label>
           <div class="config-input-group">
-            <input type="text" id="input-download-dir" placeholder="例如: /Users/scottcheng/Documents/GitHub/China12Books" />
-            <button id="btn-save-dir" class="action-btn">保存并生效</button>
-            <button id="btn-audit-history" class="secondary-btn" title="检测本地已被平台移除或更新的旧教材，自动安全迁移到 History/ 镜像目录">
-              📦 历史版本审计与归档
-            </button>
+            <input type="text" id="input-download-dir" readonly placeholder="点击右侧按钮选择保存目录..." title="点击可选择保存目录" style="cursor: pointer;" />
+            <button id="btn-save-dir" class="action-btn">📁 选择保存目录</button>
           </div>
         </div>
       </div>
@@ -110,13 +114,14 @@
       </div>
 
       <div class="batch-controls">
-        <label class="checkbox-label">
+        <label class="checkbox-label" id="label-select-page">
           <input type="checkbox" id="chk-select-page" />
           <span>选中本页 (<span id="page-count-num">0</span>)</span>
         </label>
-        <button id="btn-select-all-filtered" class="ghost-btn">
-          ✨ 全选筛选结果 (<span id="all-filtered-num">0</span> 本)
-        </button>
+        <label class="checkbox-label" id="label-select-all-filtered">
+          <input type="checkbox" id="chk-select-all-filtered" />
+          <span>全选筛选结果 (<span id="all-filtered-num">0</span> 本)</span>
+        </label>
         <button id="btn-batch-download" class="primary-btn batch-download-btn">
           🚀 批量下载选中的教材 (<span id="selected-total-num">0</span> 本)
         </button>
@@ -156,7 +161,7 @@
   <aside class="download-drawer hidden" id="download-drawer">
     <div class="drawer-header">
       <div class="drawer-title">
-        <h3>📥 下载任务管理器</h3>
+        <h3>📥 下载任务管理器 <span style="font-size:11px;font-weight:normal;background:#1e1b4b;color:#a5b4fc;border:1px solid #4338ca;padding:2px 6px;border-radius:4px;margin-left:6px;">限并发: 2</span></h3>
         <span id="drawer-summary" class="drawer-sub">0 个任务</span>
       </div>
       <button id="btn-close-drawer" class="icon-btn" title="关闭面板">✕</button>
@@ -211,6 +216,23 @@
       <div class="empty-tasks">暂无任务</div>
     </div>
   </aside>
+
+  <!-- 大批量下载确认弹窗 -->
+  <div id="confirm-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-icon">⚠️</div>
+        <h3 id="modal-title" class="modal-title">下载提示</h3>
+      </div>
+      <div id="modal-body" class="modal-body">
+        下载文件较多，将会占用较大空间，是否继续？
+      </div>
+      <div class="modal-actions">
+        <button id="modal-btn-cancel" class="modal-btn modal-btn-secondary">取消</button>
+        <button id="modal-btn-confirm" class="modal-btn modal-btn-primary">继续</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 浮动弹窗提示 (Toast) -->
   <div id="toast-container" class="toast-container"></div>

@@ -13,4 +13,5 @@ venv/
 # Node & Electron
 node_modules/
 dist/
+.idea/
 .DS_Store

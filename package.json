@@ -1,13 +1,23 @@
 {
   "name": "chinak12-book-downloader",
   "version": "1.0.0",
-  "description": "国家中小学智慧教育平台 K12 教材可视化批量下载器与版本管理系统 (纯 Node.js / Electron 原生实现)",
+  "description": "国家中小学智慧教育平台 K12 教材可视化批量下载器与版本管理系统",
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
     "server": "node server.js",
     "dev": "node server.js",
-    "pack:mac": "electron-packager . ChinaK12BookDownLoader --platform=darwin --arch=arm64 --out=dist --overwrite --prune=true --ignore=\"^/dist$\""
+    "build": "electron-builder",
+    "build:mac": "electron-builder --mac --publish never",
+    "build:mac:arm64": "electron-builder --mac --arm64 --publish never",
+    "build:mac:x64": "electron-builder --mac --x64 --publish never",
+    "build:win": "electron-builder --win --publish never",
+    "build:win:arm64": "electron-builder --win --arm64 --publish never",
+    "build:win:x64": "electron-builder --win --x64 --publish never",
+    "build:linux": "electron-builder --linux --publish never",
+    "build:linux:arm64": "electron-builder --linux AppImage deb tar.gz --arm64 --publish never",
+    "build:linux:x64": "electron-builder --linux AppImage deb tar.gz --x64 --publish never",
+    "pack:mac": "electron-builder --mac --arm64 --dir"
   },
   "keywords": [
     "k12",
@@ -21,6 +31,7 @@
   "license": "MIT",
   "devDependencies": {
     "electron": "^33.4.11",
+    "electron-builder": "^26.15.3",
     "electron-packager": "^17.1.2"
   }
 }

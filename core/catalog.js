@@ -1,7 +1,9 @@
-// 纯 Node.js / JavaScript 实现：教材目录分类、版本标注与最新在用优选引擎
+// 教材目录分类、版本标注与最新在用优选引擎
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const https = require('https');
+const { customDnsLookup } = require('./dnsResolver');
 
 // 出版社标准名称映射表（对齐 ChinaTextbook 标准）
 const PUBLISHER_MAPPING = {
@@ -37,6 +39,7 @@ const PUBLISHER_MAPPING = {
 
 const CACHE_INDEX_PATH = path.join(os.homedir(), "Library/Caches/textbook-downloader/web_index.json");
 const ASSET_INDEX_PATH = path.join(os.homedir(), "Library/Caches/textbook-downloader/asset_index.json");
+const USER_CATALOG_CACHE = path.join(os.homedir(), ".chinak12_downloader_catalog.json");
 
 /**
  * 提取标准化版本号，如 '2024修订版', '2022修订版', '2019课标版', '第4版'
@@ -257,6 +260,15 @@ function deduplicateAndPickLatest(books) {
  * 加载全部教材数据并构建过滤树选项（智能优选最新在用版）
  */
 function loadCatalogData() {
+  // 优先加载用户本地更新保存的缓存
+  if (fs.existsSync(USER_CATALOG_CACHE)) {
+    try {
+      return JSON.parse(fs.readFileSync(USER_CATALOG_CACHE, 'utf-8'));
+    } catch (e) {
+      console.warn("⚠️ 读取用户自定义 catalog_cache 失败:", e.message);
+    }
+  }
+
   const bundledCachePath = path.resolve(__dirname, '../data/catalog_cache.json');
   if (fs.existsSync(bundledCachePath)) {
     try {
@@ -329,6 +341,175 @@ function loadCatalogData() {
   };
 }
 
+const DATA_VERSION_URL = 'https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json';
+const DIM_MAP = {
+  zxxxd: 'stage',
+  zxxxk: 'subject',
+  zxxbb: 'version',
+  zxxnj: 'grade',
+  zxxcc: 'volume',
+};
+
+function fetchRemoteJson(urlStr) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const req = https.get({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      lookup: customDnsLookup,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+        'Referer': 'https://basic.smartedu.cn/',
+      },
+      timeout: 30000,
+    }, res => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} on ${urlStr}`));
+      }
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => {
+        try {
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          resolve(JSON.parse(raw));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Timeout fetching ${urlStr}`));
+    });
+    req.on('error', reject);
+  });
+}
+
+function extractTags(rawBook) {
+  const tags = { stage: [], subject: [], version: [], grade: [], volume: [] };
+  for (const tag of rawBook.tag_list || []) {
+    const dim = DIM_MAP[tag.tag_dimension_id];
+    if (dim && tag.tag_name && !tags[dim].includes(tag.tag_name)) {
+      tags[dim].push(tag.tag_name);
+    }
+  }
+  if (tags.stage.length > 1 && tags.stage.includes('特殊教育')) {
+    tags.stage = ['特殊教育'];
+  }
+  return tags;
+}
+
+function normalizeRawBook(rawBook, seq) {
+  const tags = extractTags(rawBook);
+  const size = rawBook.custom_properties?.size || rawBook.custom_properties?.sys_resource_space || 0;
+  const format = (rawBook.custom_properties?.format || 'pdf').toLowerCase();
+  const formats = {};
+  if (format === 'pdf' || format.includes('pdf') || size > 0) {
+    formats.pdf = size;
+  }
+  const title = rawBook.title || rawBook.global_title?.['zh-CN'] || '';
+  return {
+    id: rawBook.id || rawBook.global_resource_id,
+    seq: seq,
+    title: title,
+    update_time: rawBook.update_time || rawBook.update_date || '',
+    formats: formats,
+    has_pdf: 'pdf' in formats,
+    pdf_size: formats.pdf || 0,
+    has_pptx: 'pptx' in formats,
+    pptx_size: formats.pptx || 0,
+    kind: 'downloadable',
+    ...tags,
+  };
+}
+
+async function refreshCatalogFromPlatform(onProgress = () => {}) {
+  onProgress({ count: 0, message: '正在连接国家中小学智慧教育平台...' });
+
+  const ver = await fetchRemoteJson(DATA_VERSION_URL);
+  const urls = (ver.urls || '').split(',').map(u => u.trim()).filter(Boolean);
+  if (urls.length === 0) {
+    throw new Error('未获取到平台教材目录文件列表');
+  }
+
+  let allRaw = [];
+  for (let i = 0; i < urls.length; i++) {
+    const part = await fetchRemoteJson(urls[i]);
+    if (Array.isArray(part)) {
+      allRaw = allRaw.concat(part);
+    }
+    onProgress({
+      count: allRaw.length,
+      current_part: i + 1,
+      total_parts: urls.length,
+      message: `已获取 ${allRaw.length.toLocaleString()} 本教材信息`,
+    });
+  }
+
+  onProgress({
+    count: allRaw.length,
+    message: '正在解析最新在用版与分类目录...',
+  });
+
+  let seq = 1;
+  const timeMap = {};
+  const normalized = allRaw.map(b => {
+    const nb = normalizeRawBook(b, seq++);
+    timeMap[nb.id] = nb.update_time;
+    return nb;
+  });
+
+  let resolved = normalized.map(b => resolveBookItem(b, timeMap));
+  resolved = deduplicateAndPickLatest(resolved);
+  const activePdfBooks = resolved.filter(b => b.has_pdf && b.is_active);
+
+  const stages = new Set();
+  const subjects = new Set();
+  const versions = new Set();
+  const grades = new Set();
+  const volumes = new Set();
+
+  for (const item of activePdfBooks) {
+    stages.add(item.stage);
+    subjects.add(item.subject);
+    if (item.version !== '未标注') versions.add(item.version);
+    if (item.grade !== '未标注') grades.add(item.grade);
+    if (item.volume) volumes.add(item.volume);
+  }
+
+  const catalogData = {
+    books: resolved,
+    stats: {
+      total: resolved.length,
+      downloadable_pdf: activePdfBooks.length,
+      duplicates_filtered: resolved.filter(b => b.has_pdf && !b.is_active).length,
+    },
+    dimensions: {
+      stages: Array.from(stages).sort(),
+      subjects: Array.from(subjects).sort(),
+      versions: Array.from(versions).sort(),
+      grades: Array.from(grades).sort(),
+      volumes: Array.from(volumes).sort(),
+    },
+  };
+
+  // 持久化保存到本地缓存 (跨平台用户主目录优先，确保打包安装后各平台均可写)
+  try {
+    fs.writeFileSync(USER_CATALOG_CACHE, JSON.stringify(catalogData, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('⚠️ 保存 USER_CATALOG_CACHE 失败:', e.message);
+  }
+
+  const bundledCachePath = path.resolve(__dirname, '../data/catalog_cache.json');
+  try {
+    fs.writeFileSync(bundledCachePath, JSON.stringify(catalogData, null, 2), 'utf-8');
+  } catch (e) {
+    // 生产环境中打包为 asar 时只读，无需警告
+  }
+
+  return catalogData;
+}
+
 module.exports = {
   PUBLISHER_MAPPING,
   extractEditionTag,
@@ -336,4 +517,5 @@ module.exports = {
   resolveBookItem,
   deduplicateAndPickLatest,
   loadCatalogData,
+  refreshCatalogFromPlatform,
 };

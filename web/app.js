@@ -13,9 +13,12 @@ let failedSelectedIds = new Set();
 
 // DOM 元素引用
 const elCatalogStatus = document.getElementById("catalog-status");
+const elBtnFetchLatest = document.getElementById("btn-fetch-latest") || document.getElementById("btn-reindex");
+const elBadgeDlRunning = document.getElementById("badge-dl-running");
+const elBadgeDlFailed = document.getElementById("badge-dl-failed");
+const elBadgeDlCompleted = document.getElementById("badge-dl-completed");
 const elInputDownloadDir = document.getElementById("input-download-dir");
 const elBtnSaveDir = document.getElementById("btn-save-dir");
-const elBtnAuditHistory = document.getElementById("btn-audit-history");
 const elDirStatusPill = document.getElementById("dir-status-pill");
 const elDirWarningAlert = document.getElementById("dir-warning-alert");
 
@@ -33,9 +36,11 @@ const elFilteredTotal = document.getElementById("filtered-total");
 const elStatDownloadable = document.getElementById("stat-downloadable");
 const elStatCurrentMatched = document.getElementById("stat-current-matched");
 
+const elLabelSelectPage = document.getElementById("label-select-page");
 const elChkSelectPage = document.getElementById("chk-select-page");
 const elPageCountNum = document.getElementById("page-count-num");
-const elBtnSelectAllFiltered = document.getElementById("btn-select-all-filtered");
+const elLabelSelectAllFiltered = document.getElementById("label-select-all-filtered");
+const elChkSelectAllFiltered = document.getElementById("chk-select-all-filtered");
 const elAllFilteredNum = document.getElementById("all-filtered-num");
 const elBtnBatchDownload = document.getElementById("btn-batch-download");
 const elSelectedTotalNum = document.getElementById("selected-total-num");
@@ -151,7 +156,12 @@ async function loadCatalog() {
   }
 }
 
-function populateDropdown(selectEl, items) {
+function populateDropdown(selectEl, items, clearFirst = false) {
+  if (clearFirst) {
+    const firstOpt = selectEl.options[0];
+    selectEl.innerHTML = "";
+    if (firstOpt) selectEl.appendChild(firstOpt);
+  }
   items.forEach(val => {
     const opt = document.createElement("option");
     opt.value = val;
@@ -222,8 +232,7 @@ function renderTable() {
 
   if (pageItems.length === 0) {
     elBooksTbody.innerHTML = `<tr><td colspan="6" class="loading-td">没有匹配的教材资源，请调整左上方筛选条件。</td></tr>`;
-    elChkMaster.checked = false;
-    elChkSelectPage.checked = false;
+    syncSelectionUI();
     return;
   }
 
@@ -259,18 +268,41 @@ function renderTable() {
   });
 
   elBooksTbody.innerHTML = html;
-  updateMasterCheckboxState(pageItems);
+  syncSelectionUI();
 }
 
-function updateMasterCheckboxState(pageItems) {
-  if (!pageItems || pageItems.length === 0) {
-    elChkMaster.checked = false;
-    elChkSelectPage.checked = false;
-    return;
+// 统一同步全选/本页选态及显隐互斥联动
+function syncSelectionUI() {
+  const isAllFilteredSelected = filteredBooks.length > 0 && filteredBooks.every(b => selectedBookIds.has(b.id));
+
+  // 1. 全选筛选结果勾选框状态
+  if (elChkSelectAllFiltered) {
+    elChkSelectAllFiltered.checked = isAllFilteredSelected;
+    elChkSelectAllFiltered.disabled = filteredBooks.length === 0;
   }
-  const allPageSelected = pageItems.every(b => selectedBookIds.has(b.id));
-  elChkMaster.checked = allPageSelected;
-  elChkSelectPage.checked = allPageSelected;
+
+  // 2. 交互互斥：当勾选全选筛选结果后，选中本页的勾选框隐藏；全选取消后，选中本页才展示
+  if (elLabelSelectPage) {
+    if (isAllFilteredSelected) {
+      elLabelSelectPage.classList.add("hidden");
+    } else {
+      elLabelSelectPage.classList.remove("hidden");
+    }
+  }
+
+  // 3. 计算并更新当前页的选中状态 (本页复选框 与 表头全选复选框)
+  const startIdx = (currentPage - 1) * pageSize;
+  const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
+  const isPageAllSelected = pageItems.length > 0 && pageItems.every(b => selectedBookIds.has(b.id));
+
+  if (elChkSelectPage) {
+    elChkSelectPage.checked = isPageAllSelected;
+    elChkSelectPage.disabled = pageItems.length === 0;
+  }
+  if (elChkMaster) {
+    elChkMaster.checked = isPageAllSelected;
+    elChkMaster.disabled = pageItems.length === 0;
+  }
 }
 
 // 5. 事件监听器绑定
@@ -293,65 +325,186 @@ function setupEventListeners() {
     applyFilters();
   });
 
-  // 保存目录
-  elBtnSaveDir.addEventListener("click", async () => {
-    const val = elInputDownloadDir.value.trim();
-    if (!val) {
-      showToast("⚠️ 下载根目录路径不能为空！");
+  // 通用确认弹窗
+  function showConfirmDialog({ title, message, confirmText = "继续", cancelText = "取消" }) {
+    return new Promise((resolve) => {
+      const elModal = document.getElementById("confirm-modal");
+      const elTitle = document.getElementById("modal-title");
+      const elBody = document.getElementById("modal-body");
+      const elBtnConfirm = document.getElementById("modal-btn-confirm");
+      const elBtnCancel = document.getElementById("modal-btn-cancel");
+
+      if (!elModal || !elBtnConfirm || !elBtnCancel) {
+        const plainMsg = (message || "").replace(/<br\s*[\/]?>/gi, "\n").replace(/<[^>]+>/g, "");
+        const ok = window.confirm(`${title ? title + "\n\n" : ""}${plainMsg}`);
+        return resolve(ok);
+      }
+
+      if (elTitle) elTitle.textContent = title || "下载提示";
+      if (elBody) elBody.innerHTML = message;
+      elBtnConfirm.textContent = confirmText;
+      elBtnCancel.textContent = cancelText;
+
+      const cleanup = () => {
+        elModal.classList.add("hidden");
+        elBtnConfirm.removeEventListener("click", onConfirm);
+        elBtnCancel.removeEventListener("click", onCancel);
+        elModal.removeEventListener("click", onOverlayClick);
+        window.removeEventListener("keydown", onKeyDown);
+      };
+
+      const onConfirm = () => { cleanup(); resolve(true); };
+      const onCancel = () => { cleanup(); resolve(false); };
+      const onOverlayClick = (e) => { if (e.target === elModal) onCancel(); };
+      const onKeyDown = (e) => { if (e.key === "Escape") onCancel(); };
+
+      elBtnConfirm.addEventListener("click", onConfirm);
+      elBtnCancel.addEventListener("click", onCancel);
+      elModal.addEventListener("click", onOverlayClick);
+      window.addEventListener("keydown", onKeyDown);
+      elModal.classList.remove("hidden");
+    });
+  }
+
+  // 文件夹选择对话框与自动生效逻辑
+  async function chooseDownloadDirectory() {
+    let chosenPath = null;
+    if (window.electronAPI && typeof window.electronAPI.selectDirectory === "function") {
+      chosenPath = await window.electronAPI.selectDirectory(currentDownloadDir);
+    } else {
+      try {
+        const res = await fetch("/api/select_folder", { method: "POST" });
+        const data = await res.json();
+        if (data && data.success && data.path) {
+          chosenPath = data.path;
+        }
+      } catch (e) {
+        console.warn("调用文件夹选择失败:", e);
+      }
+    }
+
+    // 操作可以取消，就是不生效
+    if (!chosenPath) {
       return;
     }
+
+    // 选择之后会自动生效
+    await applyDownloadDir(chosenPath);
+  }
+
+  async function applyDownloadDir(val) {
+    const dir = (val || "").trim();
+    if (!dir) return;
     try {
       const res = await fetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ download_dir: val }),
+        body: JSON.stringify({ download_dir: dir }),
       });
       const data = await res.json();
       if (data.success) {
         currentDownloadDir = data.download_dir;
+        elInputDownloadDir.value = currentDownloadDir;
         updateDirStatus(true);
-        showToast("✅ 下载根目录已保存并成功绑定！");
+        showToast(`✅ 下载根目录已选择并自动生效: ${currentDownloadDir}`);
       } else {
-        showToast(`❌ 保存失败: ${data.error}`);
+        showToast(`❌ 设置目录失败: ${data.error}`);
       }
     } catch (e) {
       showToast(`❌ 请求失败: ${e}`);
     }
-  });
+  }
 
-  // 历史版本审计
-  elBtnAuditHistory.addEventListener("click", async () => {
-    if (!currentDownloadDir) {
-      showToast("⚠️ 请先设置下载根目录！");
-      return;
-    }
-    showToast("🔍 正在扫描本地目录与比对官方最新清单...");
+  // 点击“选择保存目录”按钮或输入框均可打开原生文件夹选择器
+  elBtnSaveDir.addEventListener("click", chooseDownloadDirectory);
+  elInputDownloadDir.addEventListener("click", chooseDownloadDirectory);
+
+  // 获取最新教材信息
+  if (elBtnFetchLatest) {
+    elBtnFetchLatest.addEventListener("click", handleFetchLatestCatalog);
+  }
+
+  async function handleFetchLatestCatalog() {
+    if (!elBtnFetchLatest) return;
+    elBtnFetchLatest.disabled = true;
+    const originalText = elBtnFetchLatest.textContent;
+    elBtnFetchLatest.textContent = "⏳ 正在连接...";
+    elCatalogStatus.textContent = "⏳ 正在连接平台...";
+
+    showToast("🌐 正在连接国家中小学智慧教育平台，准备获取最新教材信息...");
+
     try {
-      const res = await fetch("/api/audit_history", { method: "POST" });
-      const data = await res.json();
-      if (data.success) {
-        showToast(`📦 审计完成！共发现并归档了 ${data.archived_count} 本历史教材至 History/ 目录。`);
-      } else {
-        showToast(`❌ 历史归档失败: ${data.error}`);
+      const res = await fetch("/api/refresh_catalog", { method: "POST" });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
       }
-    } catch (e) {
-      showToast(`❌ 请求错误: ${e}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const payload = JSON.parse(line);
+            if (payload.type === "progress") {
+              elCatalogStatus.textContent = `⏳ ${payload.message}...`;
+              elBtnFetchLatest.textContent = `⏳ ${payload.message}...`;
+              showToast(payload.message, 2500);
+            } else if (payload.type === "done") {
+              const cat = payload.catalog;
+              if (cat) {
+                allBooks = cat.books || [];
+                const activeCount = allBooks.filter(b => b.has_pdf && b.is_active).length;
+                elCatalogStatus.textContent = `✅ 目录已就绪 (${activeCount.toLocaleString()} 本在用教材)`;
+
+                // 重新填充筛选下拉框
+                populateDropdown(elFilterStage, cat.dimensions.stages, true);
+                populateDropdown(elFilterSubject, cat.dimensions.subjects, true);
+                populateDropdown(elFilterVersion, cat.dimensions.versions, true);
+                populateDropdown(elFilterGrade, cat.dimensions.grades, true);
+                populateDropdown(elFilterVolume, cat.dimensions.volumes, true);
+
+                applyFilters();
+              }
+              showToast(`🎉 获取完成！${payload.message}`, 5000);
+            } else if (payload.type === "error") {
+              showToast(`❌ 获取最新教材信息失败: ${payload.error}`, 4000);
+            }
+          } catch (e) {
+            console.warn("解析进度数据失败:", e);
+          }
+        }
+      }
+    } catch (err) {
+      showToast(`❌ 请求平台失败: ${err.message}`, 4000);
+    } finally {
+      elBtnFetchLatest.disabled = false;
+      elBtnFetchLatest.textContent = originalText;
     }
-  });
+  }
 
   // 表格多选事件
   elBooksTbody.addEventListener("change", (e) => {
     if (e.target.classList.contains("chk-book")) {
       const id = e.target.getAttribute("data-id");
+      const tr = e.target.closest("tr");
       if (e.target.checked) {
         selectedBookIds.add(id);
+        if (tr) tr.classList.add("row-selected");
       } else {
         selectedBookIds.delete(id);
+        if (tr) tr.classList.remove("row-selected");
       }
       updateStats();
-      const startIdx = (currentPage - 1) * pageSize;
-      const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
-      updateMasterCheckboxState(pageItems);
+      syncSelectionUI();
     }
   });
 
@@ -375,29 +528,50 @@ function setupEventListeners() {
     renderTable();
   };
 
-  elChkMaster.addEventListener("change", (e) => togglePageSelection(e.target.checked));
-  elChkSelectPage.addEventListener("change", (e) => togglePageSelection(e.target.checked));
+  if (elChkMaster) elChkMaster.addEventListener("change", (e) => togglePageSelection(e.target.checked));
+  if (elChkSelectPage) elChkSelectPage.addEventListener("change", (e) => togglePageSelection(e.target.checked));
 
-  // 全选筛选结果
-  elBtnSelectAllFiltered.addEventListener("click", () => {
-    const allSelected = filteredBooks.every(b => selectedBookIds.has(b.id));
-    if (allSelected) {
-      filteredBooks.forEach(b => selectedBookIds.delete(b.id));
-      showToast("已取消全选当前筛选结果");
-    } else {
-      filteredBooks.forEach(b => selectedBookIds.add(b.id));
-      showToast(`✨ 已全选当前筛选出的 ${filteredBooks.length} 本教材！`);
-    }
-    updateStats();
-    renderTable();
-  });
+  // 全选筛选结果勾选框事件
+  if (elChkSelectAllFiltered) {
+    elChkSelectAllFiltered.addEventListener("change", (e) => {
+      if (filteredBooks.length === 0) {
+        elChkSelectAllFiltered.checked = false;
+        return;
+      }
+      if (e.target.checked) {
+        filteredBooks.forEach(b => selectedBookIds.add(b.id));
+        showToast(`✨ 已全选当前筛选出的 ${filteredBooks.length} 本教材！`);
+      } else {
+        filteredBooks.forEach(b => selectedBookIds.delete(b.id));
+        showToast("已取消全选当前筛选结果");
+      }
+      updateStats();
+      renderTable();
+    });
+  }
 
   // 批量下载
-  elBtnBatchDownload.addEventListener("click", () => {
+  elBtnBatchDownload.addEventListener("click", async () => {
     if (selectedBookIds.size === 0) {
       showToast("⚠️ 请先勾选要下载的课本，或点击“全选筛选结果”！");
       return;
     }
+
+    const count = selectedBookIds.size;
+    // 勾选项目大于100条时，提示下载文件较多，将会占用较大空间，是否继续
+    if (count > 100) {
+      const confirmed = await showConfirmDialog({
+        title: "批量下载提示",
+        message: `当前已勾选 <strong>${count}</strong> 本教材，下载文件较多，将会占用较大空间，是否继续？`,
+        confirmText: "继续",
+        cancelText: "取消",
+      });
+      if (!confirmed) {
+        return; // 点击取消，则不下载
+      }
+    }
+
+    // 点击继续，则继续下载
     triggerDownload(Array.from(selectedBookIds));
   });
 
@@ -656,9 +830,15 @@ function refreshTasksList() {
   elBadgeTabFailed.textContent = failedTasks.length;
   elBadgeTabCompleted.textContent = completedTasks.length;
 
+  // 更新顶部“下载列表”按钮内三段式数量徽标：正在下载列表数量(含进行中、暂停、队列等)/失败列表数量/完成列表数量
+  if (elBadgeDlRunning) elBadgeDlRunning.textContent = downloadingTasks.length;
+  if (elBadgeDlFailed) elBadgeDlFailed.textContent = failedTasks.length;
+  if (elBadgeDlCompleted) elBadgeDlCompleted.textContent = completedTasks.length;
+  if (elActiveBadge) elActiveBadge.textContent = downloadingTasks.length;
+
   const activeDownloading = currentTasks.filter(t => t.status === "downloading").length;
-  elActiveBadge.textContent = activeDownloading || downloadingTasks.length;
-  elDrawerSummary.textContent = `进行中: ${downloadingTasks.length} | 失败: ${failedTasks.length} | 已完成: ${completedTasks.length}`;
+  const pendingCount = currentTasks.filter(t => t.status === "pending").length;
+  elDrawerSummary.textContent = `下载中: ${activeDownloading} | 排队中: ${pendingCount} | 失败: ${failedTasks.length} | 已完成: ${completedTasks.length}`;
 
   if (currentDrawerTab === "downloading") {
     renderDownloadingTab(downloadingTasks);
@@ -675,27 +855,56 @@ function renderDownloadingTab(tasks) {
     return;
   }
 
-  let html = "";
-  tasks.forEach(task => {
-    let statusText = "下载中";
-    let statusClass = "task-status-downloading";
-    let actionBtnHtml = `<button class="task-btn" data-action="pause" data-id="${task.id}">⏸️ 暂停</button>`;
+  // 严格排序：正在下载(downloading)置顶，暂停(paused)居中，排队(pending)放后
+  const sortedTasks = [...tasks].sort((a, b) => {
+    const priority = { downloading: 0, paused: 1, pending: 2 };
+    return (priority[a.status] ?? 3) - (priority[b.status] ?? 3);
+  });
 
-    if (task.status === "pending") {
-      statusText = "排队中";
-      statusClass = "task-status-downloading";
-      actionBtnHtml = `<button class="task-btn" data-action="pause" data-id="${task.id}">⏸️ 暂停</button>`;
-    } else if (task.status === "paused") {
-      statusText = "已暂停";
-      statusClass = "task-status-paused";
-      actionBtnHtml = `<button class="task-btn task-btn-primary" data-action="resume" data-id="${task.id}">▶️ 恢复</button>`;
-    }
+  const MAX_RENDER = 80;
+  const renderList = sortedTasks.slice(0, MAX_RENDER);
+  const remainingCount = sortedTasks.length - renderList.length;
+
+  let html = "";
+  const activeCount = tasks.filter(t => t.status === "downloading").length;
+  html += `
+    <div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
+      <span>🌐 底层活跃网络连接: <strong style="color:var(--primary);">${activeCount} / 2</strong></span>
+      <span style="color:var(--text-sub);font-size:11px;">(其余排队任务无任何网络流量)</span>
+    </div>
+  `;
+
+  renderList.forEach(task => {
+    let statusText = "🚀 正在下载";
+    let statusClass = "task-status-downloading";
+    let progressClass = "progress-bar-fill";
+    let actionBtnHtml = `<button class="task-btn" data-action="pause" data-id="${task.id}">⏸️ 暂停</button>`;
 
     const downloadedMb = (task.downloaded_bytes / (1024 * 1024)).toFixed(1);
     const totalMb = task.total_bytes ? (task.total_bytes / (1024 * 1024)).toFixed(1) : "未知";
+    let speedInfo = "";
+
+    if (task.status === "downloading") {
+      statusText = "🚀 正在下载";
+      statusClass = "task-status-downloading";
+      progressClass = "progress-bar-fill"; // 亮蓝色活动进度条
+      speedInfo = task.speed_formatted || "正在建立 CDN 传输...";
+    } else if (task.status === "pending") {
+      statusText = "⏳ 队列等待中";
+      statusClass = "task-status-pending";
+      progressClass = "progress-bar-fill progress-bar-cached"; // 灰暗静态条
+      speedInfo = task.downloaded_bytes > 0 ? `断点缓存已存 ${downloadedMb} MB (未连接网络)` : "等待 Worker 拾取 (无网络)";
+      actionBtnHtml = `<button class="task-btn" data-action="pause" data-id="${task.id}">⏸️ 暂停</button>`;
+    } else if (task.status === "paused") {
+      statusText = "⏸️ 已暂停";
+      statusClass = "task-status-paused";
+      progressClass = "progress-bar-fill progress-bar-cached";
+      speedInfo = "任务已暂停 (无网络)";
+      actionBtnHtml = `<button class="task-btn task-btn-primary" data-action="resume" data-id="${task.id}">▶️ 恢复</button>`;
+    }
 
     html += `
-      <div class="task-card">
+      <div class="task-card" style="${task.status === 'downloading' ? 'border-left: 3px solid var(--primary);' : ''}">
         <div class="task-card-header">
           <div class="task-card-title-row">
             <span class="task-status-tag ${statusClass}">${statusText}</span>
@@ -707,15 +916,19 @@ function renderDownloadingTab(tasks) {
           </div>
         </div>
         <div class="progress-bar-bg">
-          <div class="progress-bar-fill" style="width: ${task.percent}%;"></div>
+          <div class="${progressClass}" style="width: ${task.percent}%;"></div>
         </div>
         <div class="task-card-footer">
           <span>${downloadedMb} MB / ${totalMb} MB (${task.percent}%)</span>
-          <span>${task.speed_formatted || ""}</span>
+          <span style="font-size:11px;color:${task.status === 'downloading' ? 'var(--primary)' : 'var(--text-sub)'}">${speedInfo}</span>
         </div>
       </div>
     `;
   });
+
+  if (remainingCount > 0) {
+    html += `<div style="text-align:center;padding:12px;color:var(--text-sub);font-size:12px;border-top:1px dashed var(--border);">还有 ${remainingCount} 本教材正在队列中等待传输...</div>`;
+  }
 
   elDrawerTasksList.innerHTML = html;
 }
@@ -789,15 +1002,16 @@ function renderCompletedTab(tasks) {
 }
 
 // 辅助工具函数
-function showToast(msg) {
+function showToast(msg, duration = 3500) {
   const container = document.getElementById("toast-container");
+  if (!container) return;
   const t = document.createElement("div");
   t.className = "toast";
   t.textContent = msg;
   container.appendChild(t);
   setTimeout(() => {
     t.remove();
-  }, 3500);
+  }, duration);
 }
 
 function debounce(fn, delay) {

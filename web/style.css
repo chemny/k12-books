@@ -92,6 +92,52 @@ body {
   margin-left: 6px;
 }
 
+/* 顶部下载列表按钮内三段式数量徽标 */
+.dl-badge-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  background: rgba(0, 0, 0, 0.28);
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.dl-badge-slash {
+  opacity: 0.45;
+  color: #fff;
+  font-weight: normal;
+  font-size: 10px;
+}
+
+.dl-num-running {
+  color: #93c5fd; /* 浅蓝：进行中/排队/暂停 */
+}
+
+.dl-num-failed {
+  color: #fca5a5; /* 浅红：下载失败 */
+}
+
+.dl-num-completed {
+  color: #86efac; /* 浅绿：已完成 */
+}
+
+/* 获取最新教材信息按钮 */
+.fetch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 0.2s ease;
+}
+
+.fetch-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
 /* 主容器 */
 .container {
   max-width: 1480px;
@@ -731,6 +777,12 @@ button {
   color: #60a5fa;
 }
 
+.task-status-pending {
+  background: rgba(148, 163, 184, 0.15);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
 .task-status-paused {
   background: rgba(245, 158, 11, 0.2);
   color: #fbbf24;
@@ -762,6 +814,11 @@ button {
   height: 100%;
   background: linear-gradient(90deg, #3b82f6, #60a5fa);
   transition: width 0.3s ease;
+}
+
+.progress-bar-cached {
+  background: #475569 !important;
+  opacity: 0.65 !important;
 }
 
 .task-card-footer {
@@ -808,3 +865,127 @@ button {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* 目录输入框只读时的样式 */
+.config-input-group input[readonly] {
+  cursor: pointer;
+  background: rgba(15, 23, 42, 0.5);
+  border-color: #334155;
+  transition: all 0.2s;
+}
+
+.config-input-group input[readonly]:hover {
+  border-color: var(--primary);
+  background: rgba(15, 23, 42, 0.7);
+}
+
+/* 模态确认弹窗样式 */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(5px);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 10000;
+  animation: modalFadeIn 0.2s ease-out;
+}
+
+.modal-overlay.hidden {
+  display: none;
+}
+
+@keyframes modalFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.modal-card {
+  background: #181b26;
+  border: 1px solid #31384e;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 440px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  overflow: hidden;
+  animation: modalPopIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes modalPopIn {
+  from { transform: scale(0.95); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.modal-header {
+  padding: 20px 24px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.modal-icon {
+  font-size: 26px;
+  line-height: 1;
+}
+
+.modal-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.modal-body {
+  padding: 6px 24px 22px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #cbd5e1;
+}
+
+.modal-body strong {
+  color: #38bdf8;
+}
+
+.modal-actions {
+  padding: 14px 24px;
+  background: #12141c;
+  border-top: 1px solid #232738;
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.modal-btn {
+  padding: 8px 20px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.modal-btn-secondary {
+  background: #232738;
+  border: 1px solid #333a52;
+  color: #cbd5e1;
+}
+
+.modal-btn-secondary:hover {
+  background: #2e344a;
+  color: #fff;
+}
+
+.modal-btn-primary {
+  background: var(--primary);
+  border: 1px solid #4f46e5;
+  color: #fff;
+}
+
+.modal-btn-primary:hover {
+  background: #4338ca;
+}
+

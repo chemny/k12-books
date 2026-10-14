@@ -1,0 +1,215 @@
+name: Release ChinaK12BookDownLoader
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '发布版本标签 (例如 v1.0.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve release ref
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+    steps:
+      - name: Resolve tag and checkout ref
+        id: resolve
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${INPUT_RELEASE_TAG}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          echo "release_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "checkout_ref=${tag}" >> "${GITHUB_OUTPUT}"
+
+  validate:
+    name: Validate tag
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate semver tag
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+        run: |
+          tag="${RELEASE_TAG}"
+          if ! [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$tag' is not a valid semver (expected vX.Y.Z[-prerelease][+build])"
+            exit 1
+          fi
+          echo "Tag '$tag' is valid."
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs:
+      - resolve
+      - validate
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          - name: windows-x64
+            os: windows-2022
+            platform: win
+            arch: x64
+          - name: windows-arm64
+            os: windows-11-arm
+            platform: win
+            arch: arm64
+          - name: macos-x64
+            os: macos-13
+            platform: mac
+            arch: x64
+          - name: macos-arm64
+            os: macos-14
+            platform: mac
+            arch: arm64
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4.3.1
+        with:
+          ref: ${{ needs.resolve.outputs.checkout_ref }}
+
+      - name: Enable Git long paths on Windows
+        if: matrix.platform == 'win'
+        shell: bash
+        run: git config --global core.longpaths true
+
+      - name: Install Linux Build Dependencies
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y icnsutils graphicsmagick xz-utils libfuse2 rpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and package (${{ matrix.platform }}-${{ matrix.arch }})
+        run: npm run build:${{ matrix.platform }}:${{ matrix.arch }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: chinak12-downloader-${{ matrix.name }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.dmg
+            dist/*.blockmap
+            dist/*.yml
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+            dist/*.tar.gz
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - resolve
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out workflow sources
+        uses: actions/checkout@v4.3.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' \
+            | LC_ALL=C sort \
+            | xargs -I{} sha256sum "{}" > SHA256SUMS.txt
+          echo "--- SHA256SUMS.txt ---"
+          cat SHA256SUMS.txt
+
+      - name: Compose release notes body
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          IS_PRERELEASE: ${{ contains(needs.resolve.outputs.release_tag, '-') }}
+        run: |
+          {
+            cat .github/release-notes/intro.md
+            echo ""
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              echo "## ⚠️ 测试版提示 (Pre-release)"
+              echo "- 该版本为预览预发布版本，可能包含试验性改动。"
+              echo ""
+            fi
+            cat .github/release-notes/macos-unsigned-zh-CN.md
+            echo ""
+            cat .github/release-notes/windows-instructions.md
+            echo ""
+            cat .github/release-notes/linux-instructions.md
+            echo ""
+            echo "## 🛡️ 文件完整性校验 (SHA-256)"
+            echo "所有发布安装包的 SHA-256 校验和均收录在 \`SHA256SUMS.txt\` 中。可在终端中运行以下命令校验："
+            echo '```bash'
+            echo 'sha256sum -c SHA256SUMS.txt --ignore-missing'
+            echo '```'
+          } > release_body.md
+
+      - name: Create draft release with assets
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          draft: true
+          prerelease: ${{ contains(needs.resolve.outputs.release_tag, '-') }}
+          generate_release_notes: true
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          name: ${{ needs.resolve.outputs.release_tag }}
+          body_path: release_body.md
+          fail_on_unmatched_files: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote draft to published release
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${RELEASE_TAG}" --draft=false --repo "${GITHUB_REPOSITORY}"

@@ -1,8 +1,7 @@
-#!/usr/bin/env node
 /**
- * ChinaK12BookDownLoader 本地服务与 API 调度中心 (纯 Node.js / JavaScript 实现)
+ * ChinaK12BookDownLoader 本地服务与 API 调度中心
  * =========================================================================
- * 零 Python 依赖，原生 RESTful API、Server-Sent Events 实时事件流与前端静态资源托管。
+ * RESTful API、Server-Sent Events 实时事件流与前端静态资源托管。
  */
 
 const http = require('http');
@@ -10,17 +9,29 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const url = require('url');
+const { exec } = require('child_process');
 
-const { loadCatalogData } = require('./core/catalog');
+const { loadCatalogData, refreshCatalogFromPlatform } = require('./core/catalog');
 const { DownloadManager } = require('./core/downloader');
-const { auditAndArchiveHistory } = require('./core/historyArchiver');
 
 const CURRENT_DIR = __dirname;
 const WEB_DIR = path.join(CURRENT_DIR, 'web');
 const CONFIG_FILE = path.join(os.homedir(), '.chinak12_downloader_config.json');
 
-const DOWNLOAD_MANAGER = new DownloadManager(5);
+const DOWNLOAD_MANAGER = new DownloadManager(2);
 let CATALOG_DATA = null;
+
+const sseClients = new Set();
+function broadcastSSE(payload) {
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const clientRes of sseClients) {
+    try {
+      clientRes.write(data);
+    } catch (e) {
+      sseClients.delete(clientRes);
+    }
+  }
+}
 
 function getStoredConfig() {
   if (fs.existsSync(CONFIG_FILE)) {
@@ -78,12 +89,14 @@ const MIME_TYPES = {
 
 function handleSSE(req, res) {
   res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
+    'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
   });
   res.write('\n');
+
+  sseClients.add(res);
 
   const onEvent = (payload) => {
     try {
@@ -108,21 +121,25 @@ function handleSSE(req, res) {
 
   req.on('close', () => {
     clearInterval(timer);
+    sseClients.delete(res);
     DOWNLOAD_MANAGER.unsubscribe(onEvent);
   });
 }
 
 function parseBody(req) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks = [];
+    let totalLen = 0;
     req.on('data', chunk => {
-      body += chunk;
-      if (body.length > 10 * 1024 * 1024) {
+      chunks.push(chunk);
+      totalLen += chunk.length;
+      if (totalLen > 10 * 1024 * 1024) {
         reject(new Error('Payload too large'));
       }
     });
     req.on('end', () => {
       try {
+        const body = Buffer.concat(chunks).toString('utf-8');
         resolve(body ? JSON.parse(body) : {});
       } catch (err) {
         resolve({});
@@ -204,14 +221,84 @@ const server = http.createServer(async (req, res) => {
       if (!newDir) {
         return sendJson(res, { error: '下载目录不能为空' }, 400);
       }
+      const resolvedDir = path.resolve(newDir);
+
+      // 1. 如果路径指向 macOS 外接磁盘 (/Volumes/xxx)，先检查该磁盘是否挂载
+      if (resolvedDir.startsWith('/Volumes/')) {
+        const parts = resolvedDir.split(path.sep); // ['', 'Volumes', 'VolumeName', ...]
+        const volumeName = parts[2];
+        const volumeRoot = `/Volumes/${volumeName}`;
+        if (!fs.existsSync(volumeRoot)) {
+          return sendJson(res, {
+            error: `外接磁盘 [${volumeName}] 当前未连接或未挂载，请确认外接硬盘已插紧并挂载！`
+          }, 400);
+        }
+      }
+
+      // 2. 检查或创建目录，并验证可读写权限
       try {
-        fs.mkdirSync(newDir, { recursive: true });
+        if (!fs.existsSync(resolvedDir)) {
+          fs.mkdirSync(resolvedDir, { recursive: true });
+        }
+        fs.accessSync(resolvedDir, fs.constants.R_OK | fs.constants.W_OK);
       } catch (e) {
+        if (e.code === 'EACCES' || e.code === 'EPERM') {
+          return sendJson(res, {
+            error: `权限不足: macOS 拒绝访问该目录 (${e.message})。请检查系统设置 -> 隐私与安全性，或确认该目录具有写权限。`
+          }, 400);
+        }
         return sendJson(res, { error: `无法创建或访问该目录: ${e.message}` }, 400);
       }
-      const resolvedDir = path.resolve(newDir);
+
       saveStoredConfig({ download_dir: resolvedDir });
       return sendJson(res, { success: true, download_dir: resolvedDir });
+    }
+
+    if (pathname === '/api/select_folder') {
+      if (process.platform === 'darwin') {
+        exec(`osascript -e 'POSIX path of (choose folder with prompt "请选择教材下载保存目录")'`, (err, stdout) => {
+          if (err || !stdout || !stdout.trim()) {
+            return sendJson(res, { canceled: true });
+          }
+          const chosen = stdout.trim();
+          return sendJson(res, { success: true, path: chosen });
+        });
+        return;
+      } else {
+        return sendJson(res, { canceled: true, message: '请在桌面客户端选择目录' });
+      }
+    }
+
+    if (pathname === '/api/refresh_catalog') {
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+      });
+      try {
+        const onProgress = (info) => {
+          res.write(JSON.stringify({ type: 'progress', ...info }) + '\n');
+          broadcastSSE({ type: 'catalog_progress', ...info });
+        };
+        const newCatalog = await refreshCatalogFromPlatform(onProgress);
+        CATALOG_DATA = newCatalog;
+        const doneMsg = `共计获取最新教材信息 ${newCatalog.stats.total.toLocaleString()} 本（当前在用教材 ${newCatalog.stats.downloadable_pdf.toLocaleString()} 本）`;
+        const donePayload = {
+          type: 'done',
+          total: newCatalog.stats.total,
+          downloadable: newCatalog.stats.downloadable_pdf,
+          message: doneMsg,
+          catalog: newCatalog,
+        };
+        res.write(JSON.stringify(donePayload) + '\n');
+        broadcastSSE(donePayload);
+        res.end();
+      } catch (err) {
+        res.write(JSON.stringify({ type: 'error', error: err.message }) + '\n');
+        res.end();
+      }
+      return;
     }
 
     if (pathname === '/api/download') {
@@ -291,24 +378,6 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/tasks/cancel') {
       DOWNLOAD_MANAGER.pauseAll();
       return sendJson(res, { success: true });
-    }
-
-    if (pathname === '/api/audit_history') {
-      const cfg = getStoredConfig();
-      const targetRoot = cfg.download_dir || '';
-      if (!targetRoot || !fs.existsSync(targetRoot)) {
-        return sendJson(res, { error: '下载目录尚未设置或不存在' }, 400);
-      }
-
-      if (!CATALOG_DATA) {
-        CATALOG_DATA = loadCatalogData();
-      }
-
-      const validRelPaths = new Set(
-        CATALOG_DATA.books.filter(b => b.has_pdf).map(b => b.relative_path)
-      );
-      const result = auditAndArchiveHistory(targetRoot, validRelPaths);
-      return sendJson(res, result);
     }
 
     return sendJson(res, { error: 'Not Found' }, 404);
