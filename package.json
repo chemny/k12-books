@@ -6,7 +6,8 @@
   "scripts": {
     "start": "electron .",
     "server": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "pack:mac": "electron-packager . ChinaK12BookDownLoader --platform=darwin --arch=arm64 --out=dist --overwrite --prune=true --ignore=\"^/dist$\""
   },
   "keywords": [
     "k12",
@@ -19,6 +20,7 @@
   "author": "scottcheng",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "^33.4.11",
+    "electron-packager": "^17.1.2"
   }
 }

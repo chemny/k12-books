@@ -257,6 +257,15 @@ function deduplicateAndPickLatest(books) {
  * 加载全部教材数据并构建过滤树选项（智能优选最新在用版）
  */
 function loadCatalogData() {
+  const bundledCachePath = path.resolve(__dirname, '../data/catalog_cache.json');
+  if (fs.existsSync(bundledCachePath)) {
+    try {
+      return JSON.parse(fs.readFileSync(bundledCachePath, 'utf-8'));
+    } catch (e) {
+      console.warn("⚠️ 读取预置 catalog_cache 失败:", e.message);
+    }
+  }
+
   let rawBooks = [];
   if (fs.existsSync(CACHE_INDEX_PATH)) {
     try {

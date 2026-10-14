@@ -267,9 +267,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function runServer(port = 8080) {
+function runServer(port = 8080, callback = null) {
+  server.once('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.log(`⚠️ 端口 ${port} 已被占用，正在切换至备用端口 ${port + 1}...`);
+      runServer(port + 1, callback);
+    } else {
+      console.error('服务器启动异常:', err);
+    }
+  });
+
   server.listen(port, '127.0.0.1', () => {
     console.log(`🚀 ChinaK12BookDownLoader (纯 Node.js 服务) 已就绪: http://127.0.0.1:${port}`);
+    if (callback) callback(port);
   });
   return server;
 }

@@ -4,8 +4,9 @@ const path = require("path");
 const { runServer, server } = require("../server");
 
 let mainWindow;
+let activePort = 8080;
 
-function createWindow() {
+function createWindow(port = 8080) {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -20,7 +21,7 @@ function createWindow() {
     },
   });
 
-  mainWindow.loadURL("http://127.0.0.1:8080");
+  mainWindow.loadURL(`http://127.0.0.1:${port}`);
 
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -28,12 +29,16 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  // 原生启动 Node.js HTTP 核心服务
-  runServer(8080);
-  createWindow();
+  // 原生启动 Node.js HTTP 核心服务，端口就绪后加载窗口
+  runServer(8080, (port) => {
+    activePort = port;
+    createWindow(port);
+  });
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow(activePort);
+    }
   });
 });
 
