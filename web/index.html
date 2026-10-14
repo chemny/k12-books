@@ -152,21 +152,63 @@
     </div>
   </main>
 
-  <!-- 右侧抽屉：下载任务管理器 -->
+  <!-- 右侧抽屉：下载任务管理器 (支持 3 标签页分类与精细化管控) -->
   <aside class="download-drawer hidden" id="download-drawer">
     <div class="drawer-header">
       <div class="drawer-title">
-        <h3>📥 下载任务列表</h3>
+        <h3>📥 下载任务管理器</h3>
         <span id="drawer-summary" class="drawer-sub">0 个任务</span>
       </div>
-      <div class="drawer-header-actions">
-        <button id="btn-clear-completed" class="ghost-btn small-btn" title="清空已完成和已跳过的记录">清空已完成</button>
-        <button id="btn-close-drawer" class="icon-btn" title="关闭面板">✕</button>
+      <button id="btn-close-drawer" class="icon-btn" title="关闭面板">✕</button>
+    </div>
+
+    <!-- 三大标签页导航栏 -->
+    <div class="drawer-tabs">
+      <button class="drawer-tab active" id="tab-btn-downloading" data-tab="downloading">
+        正在下载 <span id="badge-tab-downloading" class="tab-badge">0</span>
+      </button>
+      <button class="drawer-tab" id="tab-btn-failed" data-tab="failed">
+        下载失败 <span id="badge-tab-failed" class="tab-badge badge-danger">0</span>
+      </button>
+      <button class="drawer-tab" id="tab-btn-completed" data-tab="completed">
+        下载成功 <span id="badge-tab-completed" class="tab-badge badge-success">0</span>
+      </button>
+    </div>
+
+    <!-- 标签 1 操作栏：正在下载 -->
+    <div class="drawer-subbar" id="subbar-downloading">
+      <div class="subbar-actions">
+        <button id="btn-pause-all" class="ghost-btn small-btn" title="暂停所有进行中与排队中的任务">⏸️ 全部暂停</button>
+        <button id="btn-resume-all" class="ghost-btn small-btn" title="恢复所有暂停的任务">▶️ 全部恢复</button>
+      </div>
+      <button id="btn-clear-downloading" class="danger-btn small-btn" title="清空所有未完成任务，删除下载中的临时文件，保留已下载完整的书籍">🗑️ 清空任务</button>
+    </div>
+
+    <!-- 标签 2 操作栏：下载失败 (支持批量勾选与清理) -->
+    <div class="drawer-subbar hidden" id="subbar-failed">
+      <div class="subbar-actions">
+        <label class="checkbox-label failed-select-all">
+          <input type="checkbox" id="chk-failed-select-all" />
+          <span>全选 (<span id="failed-selected-count">0</span>)</span>
+        </label>
+        <button id="btn-retry-selected" class="primary-btn small-btn hidden">🔄 批量重试</button>
+        <button id="btn-delete-selected" class="danger-btn small-btn hidden">🗑️ 批量删除</button>
+      </div>
+      <div class="subbar-actions-right">
+        <button id="btn-retry-all-failed" class="secondary-btn small-btn" title="将所有失败的任务重新加入下载队列">🔄 全部重新下载</button>
+        <button id="btn-clear-failed" class="danger-btn small-btn" title="删除所有失败任务，同时删除对应的失败临时文件">🗑️ 清空失败任务</button>
       </div>
     </div>
 
+    <!-- 标签 3 操作栏：下载成功 -->
+    <div class="drawer-subbar hidden" id="subbar-completed">
+      <span class="subbar-tip">文件保存在指定根目录中</span>
+      <button id="btn-clear-completed" class="ghost-btn small-btn" title="清空成功记录 (不删除本地书籍文件)">清空成功列表</button>
+    </div>
+
+    <!-- 任务卡片滚动列表容器 -->
     <div class="drawer-body" id="drawer-tasks-list">
-      <div class="empty-tasks">暂无下载任务，在主界面勾选课本后点击“批量下载”即可加入队列。</div>
+      <div class="empty-tasks">暂无任务</div>
     </div>
   </aside>
 

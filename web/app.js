@@ -1,4 +1,4 @@
-// ChinaK12BookDownLoader 现代化前端交互引擎 (以官方最新为准)
+// ChinaK12BookDownLoader 现代化前端交互引擎 (含三标签下载管理器与精准生命周期控制)
 
 let allBooks = [];
 let filteredBooks = [];
@@ -6,7 +6,10 @@ let selectedBookIds = new Set();
 let currentDownloadDir = "";
 let currentPage = 1;
 const pageSize = 50;
+
 let currentTasks = [];
+let currentDrawerTab = "downloading"; // "downloading" | "failed" | "completed"
+let failedSelectedIds = new Set();
 
 // DOM 元素引用
 const elCatalogStatus = document.getElementById("catalog-status");
@@ -44,21 +47,58 @@ const elTotalPageNum = document.getElementById("total-page-num");
 const elBtnPrevPage = document.getElementById("btn-prev-page");
 const elBtnNextPage = document.getElementById("btn-next-page");
 
+// 抽屉与标签栏 DOM
 const elDownloadDrawer = document.getElementById("download-drawer");
 const elBtnToggleDrawer = document.getElementById("btn-toggle-drawer");
 const elBtnCloseDrawer = document.getElementById("btn-close-drawer");
 const elActiveBadge = document.getElementById("active-badge");
 const elDrawerSummary = document.getElementById("drawer-summary");
 const elDrawerTasksList = document.getElementById("drawer-tasks-list");
+
+const elTabBtnDownloading = document.getElementById("tab-btn-downloading");
+const elTabBtnFailed = document.getElementById("tab-btn-failed");
+const elTabBtnCompleted = document.getElementById("tab-btn-completed");
+const elBadgeTabDownloading = document.getElementById("badge-tab-downloading");
+const elBadgeTabFailed = document.getElementById("badge-tab-failed");
+const elBadgeTabCompleted = document.getElementById("badge-tab-completed");
+
+const elSubbarDownloading = document.getElementById("subbar-downloading");
+const elSubbarFailed = document.getElementById("subbar-failed");
+const elSubbarCompleted = document.getElementById("subbar-completed");
+
+const elBtnPauseAll = document.getElementById("btn-pause-all");
+const elBtnResumeAll = document.getElementById("btn-resume-all");
+const elBtnClearDownloading = document.getElementById("btn-clear-downloading");
+
+const elChkFailedSelectAll = document.getElementById("chk-failed-select-all");
+const elFailedSelectedCount = document.getElementById("failed-selected-count");
+const elBtnRetrySelected = document.getElementById("btn-retry-selected");
+const elBtnDeleteSelected = document.getElementById("btn-delete-selected");
+const elBtnRetryAllFailed = document.getElementById("btn-retry-all-failed");
+const elBtnClearFailed = document.getElementById("btn-clear-failed");
+
 const elBtnClearCompleted = document.getElementById("btn-clear-completed");
 
 // 初始化
 document.addEventListener("DOMContentLoaded", async () => {
   setupEventListeners();
+  setupBeforeUnload();
   await loadConfig();
   await loadCatalog();
   initSSE();
 });
+
+// 退出/关闭窗口安全提醒拦截
+function setupBeforeUnload() {
+  window.addEventListener("beforeunload", (e) => {
+    const hasActive = currentTasks.some(t => t.status === "downloading" || t.status === "pending");
+    if (hasActive) {
+      e.preventDefault();
+      e.returnValue = "当前有正在进行的下载任务，关闭后下载将被终止。确定离开吗？";
+      return e.returnValue;
+    }
+  });
+}
 
 // 1. 加载下载目录配置
 async function loadConfig() {
@@ -87,7 +127,7 @@ function updateDirStatus(isReady) {
   }
 }
 
-// 2. 加载教材数据与维度 (默认只选官方最新在用版)
+// 2. 加载教材数据与维度 (以官方最新在用为准)
 async function loadCatalog() {
   try {
     elCatalogStatus.textContent = "正在载入目录...";
@@ -96,7 +136,7 @@ async function loadCatalog() {
 
     allBooks = data.books || [];
     const activeCount = allBooks.filter(b => b.has_pdf && b.is_active).length;
-    elCatalogStatus.textContent = `✅ 目录已就绪 (${activeCount.toLocaleString()} 本最新教材)`;
+    elCatalogStatus.textContent = `✅ 目录已就绪 (${activeCount.toLocaleString()} 本在用教材)`;
 
     populateDropdown(elFilterStage, data.dimensions.stages);
     populateDropdown(elFilterSubject, data.dimensions.subjects);
@@ -120,7 +160,7 @@ function populateDropdown(selectEl, items) {
   });
 }
 
-// 3. 筛选过滤 (默认以官网最新在用为准，排除过时重复件)
+// 3. 筛选过滤
 function applyFilters() {
   const stage = elFilterStage.value;
   const subject = elFilterSubject.value;
@@ -132,7 +172,6 @@ function applyFilters() {
   const search = elFilterSearch.value.trim().toLowerCase();
 
   filteredBooks = allBooks.filter(book => {
-    // 核心改进：以官方最新在用为准，自动折叠旧重复条目
     if (!book.is_active) return false;
 
     if (stage && book.stage !== stage) return false;
@@ -148,109 +187,95 @@ function applyFilters() {
 
     if (search) {
       const matchTitle = (book.title || "").toLowerCase().includes(search);
-      const matchPath = (book.relative_path || "").toLowerCase().includes(search);
-      if (!matchTitle && !matchPath) return false;
+      const matchClean = (book.clean_title || "").toLowerCase().includes(search);
+      const matchPub = (book.publisher_dir || "").toLowerCase().includes(search);
+      if (!matchTitle && !matchClean && !matchPub) return false;
     }
+
     return true;
   });
 
   currentPage = 1;
-  renderTable();
   updateStats();
+  renderTable();
 }
 
 function updateStats() {
   elFilteredTotal.textContent = filteredBooks.length.toLocaleString();
-  const downloadableCount = filteredBooks.filter(b => b.has_pdf).length;
-  elStatDownloadable.textContent = downloadableCount.toLocaleString();
+  elStatDownloadable.textContent = allBooks.filter(b => b.has_pdf && b.is_active).length.toLocaleString();
   elStatCurrentMatched.textContent = filteredBooks.length.toLocaleString();
-
-  elAllFilteredNum.textContent = downloadableCount.toLocaleString();
+  elAllFilteredNum.textContent = filteredBooks.length.toLocaleString();
   elSelectedTotalNum.textContent = selectedBookIds.size.toLocaleString();
 }
 
-// 4. 表格渲染与分页
+// 4. 表格渲染
 function renderTable() {
   const totalPages = Math.max(1, Math.ceil(filteredBooks.length / pageSize));
   elCurPageNum.textContent = currentPage;
   elTotalPageNum.textContent = totalPages;
-
   elBtnPrevPage.disabled = currentPage <= 1;
   elBtnNextPage.disabled = currentPage >= totalPages;
 
-  const start = (currentPage - 1) * pageSize;
-  const pageBooks = filteredBooks.slice(start, start + pageSize);
-  elPageCountNum.textContent = pageBooks.length;
+  const startIdx = (currentPage - 1) * pageSize;
+  const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
+  elPageCountNum.textContent = pageItems.length;
 
-  if (pageBooks.length === 0) {
-    elBooksTbody.innerHTML = `<tr><td colspan="6" class="loading-td">未找到匹配的教材资源</td></tr>`;
+  if (pageItems.length === 0) {
+    elBooksTbody.innerHTML = `<tr><td colspan="6" class="loading-td">没有匹配的教材资源，请调整左上方筛选条件。</td></tr>`;
     elChkMaster.checked = false;
     elChkSelectPage.checked = false;
     return;
   }
 
   let html = "";
-  let pageAllChecked = true;
-
-  pageBooks.forEach(book => {
-    const isChecked = selectedBookIds.has(book.id);
-    if (!isChecked) pageAllChecked = false;
-
-    const sizeMb = (book.pdf_size / (1024 * 1024)).toFixed(1);
-    const editionTagHtml = book.edition_tag
-      ? `<span class="edition-badge">${escapeHtml(book.edition_tag)}</span>`
-      : "";
+  pageItems.forEach((book, idx) => {
+    const isChecked = selectedBookIds.has(book.id) ? "checked" : "";
+    const seqNum = startIdx + idx + 1;
+    const sizeMb = book.pdf_size ? (book.pdf_size / (1024 * 1024)).toFixed(1) + " MB" : "未知大小";
 
     html += `
-      <tr>
-        <td><input type="checkbox" class="row-chk" data-id="${book.id}" ${isChecked ? "checked" : ""} /></td>
-        <td style="color: var(--text-sub);">${book.seq}</td>
-        <td class="book-title-cell">
-          ${escapeHtml(book.clean_title || book.title)}
-          ${editionTagHtml}
-          <span style="font-size:11px;color:#38bdf8;background:rgba(56,189,248,0.1);padding:1px 5px;border-radius:4px;margin-left:4px;">最新在用</span>
-        </td>
-        <td class="category-cell">
-          ${escapeHtml(book.stage)} · ${escapeHtml(book.subject)} · ${escapeHtml(book.publisher_dir)} · ${escapeHtml(book.grade)}
+      <tr class="${isChecked ? "row-selected" : ""}" data-id="${book.id}">
+        <td><input type="checkbox" class="chk-book" data-id="${book.id}" ${isChecked} /></td>
+        <td class="td-seq">${seqNum}</td>
+        <td>
+          <div class="book-title-cell">
+            <span class="book-title-text">${escapeHtml(book.clean_title)}</span>
+            <span class="edition-badge">${escapeHtml(book.edition_tag)}</span>
+          </div>
         </td>
         <td>
-          ${book.has_pdf ? `<span class="tag-file-badge">PDF ${sizeMb} MB</span>` : `<span style="color:var(--text-sub)">无PDF</span>`}
+          <span class="cat-pill">${escapeHtml(book.stage)}</span>
+          <span class="cat-pill cat-sub">${escapeHtml(book.subject)}</span>
+          <span class="cat-pill cat-pub">${escapeHtml(book.publisher_dir.split("-")[0])}</span>
         </td>
         <td>
-          <button class="action-btn small-btn single-download-btn" data-id="${book.id}">下载</button>
+          <span class="format-tag tag-pdf">PDF (${sizeMb})</span>
+        </td>
+        <td>
+          <button class="action-btn small-btn btn-single-dl" data-id="${book.id}">下载</button>
         </td>
       </tr>
     `;
   });
 
   elBooksTbody.innerHTML = html;
-  elChkMaster.checked = pageAllChecked && pageBooks.length > 0;
-  elChkSelectPage.checked = pageAllChecked && pageBooks.length > 0;
-
-  // 绑定行选择事件
-  document.querySelectorAll(".row-chk").forEach(chk => {
-    chk.addEventListener("change", e => {
-      const id = e.target.getAttribute("data-id");
-      if (e.target.checked) {
-        selectedBookIds.add(id);
-      } else {
-        selectedBookIds.delete(id);
-      }
-      updateStats();
-    });
-  });
-
-  // 绑定单本下载
-  document.querySelectorAll(".single-download-btn").forEach(btn => {
-    btn.addEventListener("click", e => {
-      const id = e.target.getAttribute("data-id");
-      triggerDownload([id]);
-    });
-  });
+  updateMasterCheckboxState(pageItems);
 }
 
-// 5. 事件监听器
+function updateMasterCheckboxState(pageItems) {
+  if (!pageItems || pageItems.length === 0) {
+    elChkMaster.checked = false;
+    elChkSelectPage.checked = false;
+    return;
+  }
+  const allPageSelected = pageItems.every(b => selectedBookIds.has(b.id));
+  elChkMaster.checked = allPageSelected;
+  elChkSelectPage.checked = allPageSelected;
+}
+
+// 5. 事件监听器绑定
 function setupEventListeners() {
+  // 筛选事件
   [elFilterStage, elFilterSubject, elFilterVersion, elFilterGrade, elFilterVolume, elFilterFormat, elFilterStatus].forEach(el => {
     el.addEventListener("change", applyFilters);
   });
@@ -268,11 +293,11 @@ function setupEventListeners() {
     applyFilters();
   });
 
-  // 保存下载根目录
+  // 保存目录
   elBtnSaveDir.addEventListener("click", async () => {
     const val = elInputDownloadDir.value.trim();
     if (!val) {
-      showToast("⚠️ 请输入有效的下载根目录路径");
+      showToast("⚠️ 下载根目录路径不能为空！");
       return;
     }
     try {
@@ -285,68 +310,92 @@ function setupEventListeners() {
       if (data.success) {
         currentDownloadDir = data.download_dir;
         updateDirStatus(true);
-        showToast("✅ 下载根目录已保存并生效！");
+        showToast("✅ 下载根目录已保存并成功绑定！");
       } else {
         showToast(`❌ 保存失败: ${data.error}`);
       }
     } catch (e) {
-      showToast(`❌ 网络请求失败: ${e}`);
+      showToast(`❌ 请求失败: ${e}`);
     }
   });
 
-  // 历史版本审计与归档 (若已存在则替换)
+  // 历史版本审计
   elBtnAuditHistory.addEventListener("click", async () => {
     if (!currentDownloadDir) {
-      showToast("⚠️ 请先设置下载根目录");
+      showToast("⚠️ 请先设置下载根目录！");
       return;
     }
-    showToast("🔍 正在比对本地教材与平台最新版本，扫描下架旧版...");
+    showToast("🔍 正在扫描本地目录与比对官方最新清单...");
     try {
       const res = await fetch("/api/audit_history", { method: "POST" });
       const data = await res.json();
       if (data.success) {
-        if (data.archived_count > 0) {
-          showToast(`📦 审计完成！已将 ${data.archived_count} 个历史旧版文件安全归档至 History/ 对应目录（存在已自动替换）`);
-        } else {
-          showToast("✨ 审计完成！本地所有教材均为当前最新版本，未发现需归档的旧版文件。");
-        }
+        showToast(`📦 审计完成！共发现并归档了 ${data.archived_count} 本历史教材至 History/ 目录。`);
       } else {
-        showToast(`❌ 审计失败: ${data.error}`);
+        showToast(`❌ 历史归档失败: ${data.error}`);
       }
     } catch (e) {
-      showToast(`❌ 请求异常: ${e}`);
+      showToast(`❌ 请求错误: ${e}`);
+    }
+  });
+
+  // 表格多选事件
+  elBooksTbody.addEventListener("change", (e) => {
+    if (e.target.classList.contains("chk-book")) {
+      const id = e.target.getAttribute("data-id");
+      if (e.target.checked) {
+        selectedBookIds.add(id);
+      } else {
+        selectedBookIds.delete(id);
+      }
+      updateStats();
+      const startIdx = (currentPage - 1) * pageSize;
+      const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
+      updateMasterCheckboxState(pageItems);
+    }
+  });
+
+  // 单本下载
+  elBooksTbody.addEventListener("click", (e) => {
+    if (e.target.classList.contains("btn-single-dl")) {
+      const id = e.target.getAttribute("data-id");
+      triggerDownload([id]);
     }
   });
 
   // 选中当前页
-  const togglePageSelection = (isChecked) => {
-    const start = (currentPage - 1) * pageSize;
-    const pageBooks = filteredBooks.slice(start, start + pageSize);
-    pageBooks.forEach(b => {
-      if (isChecked) selectedBookIds.add(b.id);
+  const togglePageSelection = (checked) => {
+    const startIdx = (currentPage - 1) * pageSize;
+    const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
+    pageItems.forEach(b => {
+      if (checked) selectedBookIds.add(b.id);
       else selectedBookIds.delete(b.id);
     });
-    renderTable();
     updateStats();
+    renderTable();
   };
 
-  elChkSelectPage.addEventListener("change", e => togglePageSelection(e.target.checked));
-  elChkMaster.addEventListener("change", e => togglePageSelection(e.target.checked));
+  elChkMaster.addEventListener("change", (e) => togglePageSelection(e.target.checked));
+  elChkSelectPage.addEventListener("change", (e) => togglePageSelection(e.target.checked));
 
-  // 全选当前筛选出的所有最新教材
+  // 全选筛选结果
   elBtnSelectAllFiltered.addEventListener("click", () => {
-    filteredBooks.forEach(b => {
-      if (b.has_pdf) selectedBookIds.add(b.id);
-    });
-    renderTable();
+    const allSelected = filteredBooks.every(b => selectedBookIds.has(b.id));
+    if (allSelected) {
+      filteredBooks.forEach(b => selectedBookIds.delete(b.id));
+      showToast("已取消全选当前筛选结果");
+    } else {
+      filteredBooks.forEach(b => selectedBookIds.add(b.id));
+      showToast(`✨ 已全选当前筛选出的 ${filteredBooks.length} 本教材！`);
+    }
     updateStats();
-    showToast(`✅ 已全选当前筛选出的全部 ${selectedBookIds.size} 本最新在用教材！`);
+    renderTable();
   });
 
   // 批量下载
   elBtnBatchDownload.addEventListener("click", () => {
     if (selectedBookIds.size === 0) {
-      showToast("⚠️ 请先勾选要下载的课本，或点击“全选筛选结果”");
+      showToast("⚠️ 请先勾选要下载的课本，或点击“全选筛选结果”！");
       return;
     }
     triggerDownload(Array.from(selectedBookIds));
@@ -375,13 +424,184 @@ function setupEventListeners() {
     elDownloadDrawer.classList.add("hidden");
   });
 
-  elBtnClearCompleted.addEventListener("click", async () => {
-    await fetch("/api/tasks/clear", { method: "POST" });
+  // --- 抽屉 3 标签页切换逻辑 ---
+  [elTabBtnDownloading, elTabBtnFailed, elTabBtnCompleted].forEach(btn => {
+    btn.addEventListener("click", () => {
+      [elTabBtnDownloading, elTabBtnFailed, elTabBtnCompleted].forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      currentDrawerTab = btn.getAttribute("data-tab");
+
+      // 切换对应的子工具栏
+      elSubbarDownloading.classList.toggle("hidden", currentDrawerTab !== "downloading");
+      elSubbarFailed.classList.toggle("hidden", currentDrawerTab !== "failed");
+      elSubbarCompleted.classList.toggle("hidden", currentDrawerTab !== "completed");
+
+      refreshTasksList();
+    });
+  });
+
+  // --- 正在下载页操作 ---
+  elBtnPauseAll.addEventListener("click", async () => {
+    await fetch("/api/tasks/pause", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    showToast("⏸️ 已暂停所有下载任务");
+  });
+
+  elBtnResumeAll.addEventListener("click", async () => {
+    await fetch("/api/tasks/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    showToast("▶️ 已恢复所有下载任务");
+  });
+
+  elBtnClearDownloading.addEventListener("click", async () => {
+    if (!confirm("确定要清空所有未完成的任务吗？\n下载中的临时文件将被删除，已下载完整的书籍将保留。")) return;
+    const res = await fetch("/api/tasks/clear_downloading", { method: "POST" });
+    const data = await res.json();
+    showToast(`🗑️ 已清空 ${data.count || 0} 个未完成任务并清理临时文件`);
     refreshTasksList();
+  });
+
+  // --- 下载失败页操作 ---
+  elChkFailedSelectAll.addEventListener("change", (e) => {
+    const failedTasks = currentTasks.filter(t => t.status === "failed");
+    if (e.target.checked) {
+      failedTasks.forEach(t => failedSelectedIds.add(t.id));
+    } else {
+      failedSelectedIds.clear();
+    }
+    updateFailedSelectionUI();
+    renderFailedTab();
+  });
+
+  elBtnRetryAllFailed.addEventListener("click", async () => {
+    const res = await fetch("/api/tasks/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const data = await res.json();
+    showToast(`🔄 已将 ${data.count || 0} 个失败任务重新加入下载队列！`);
+  });
+
+  elBtnRetrySelected.addEventListener("click", async () => {
+    if (failedSelectedIds.size === 0) return;
+    const res = await fetch("/api/tasks/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_ids: Array.from(failedSelectedIds) }),
+    });
+    const data = await res.json();
+    showToast(`🔄 已重新加入 ${data.count || 0} 个选中任务`);
+    failedSelectedIds.clear();
+    updateFailedSelectionUI();
+  });
+
+  elBtnClearFailed.addEventListener("click", async () => {
+    if (!confirm("确定要清空所有失败任务吗？对应的失败/损坏文件将被删除。")) return;
+    const res = await fetch("/api/tasks/clear_failed", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const data = await res.json();
+    showToast(`🗑️ 已清除 ${data.count || 0} 个失败任务及临时文件`);
+    failedSelectedIds.clear();
+    updateFailedSelectionUI();
+    refreshTasksList();
+  });
+
+  elBtnDeleteSelected.addEventListener("click", async () => {
+    if (failedSelectedIds.size === 0) return;
+    if (!confirm(`确定要删除选中的 ${failedSelectedIds.size} 个失败任务吗？对应的失败文件将被删除。`)) return;
+    await fetch("/api/tasks/clear_failed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_ids: Array.from(failedSelectedIds) }),
+    });
+    showToast(`🗑️ 已删除选中的 ${failedSelectedIds.size} 个失败任务`);
+    failedSelectedIds.clear();
+    updateFailedSelectionUI();
+    refreshTasksList();
+  });
+
+  // --- 下载成功页操作 ---
+  elBtnClearCompleted.addEventListener("click", async () => {
+    await fetch("/api/tasks/clear_completed", { method: "POST" });
+    showToast("🗑️ 已清空已完成记录（本地文件完好保留）");
+    refreshTasksList();
+  });
+
+  // --- 抽屉列表项按钮事件代理 ---
+  elDrawerTasksList.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    const taskId = btn.getAttribute("data-id");
+    if (!action || !taskId) return;
+
+    if (action === "pause") {
+      await fetch("/api/tasks/pause", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: taskId }),
+      });
+      showToast("⏸️ 任务已暂停");
+    } else if (action === "resume") {
+      await fetch("/api/tasks/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: taskId }),
+      });
+      showToast("▶️ 任务已恢复");
+    } else if (action === "retry-single") {
+      await fetch("/api/tasks/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_ids: [taskId] }),
+      });
+      showToast("🔄 已加入重试队列");
+    } else if (action === "delete") {
+      await fetch("/api/tasks/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: taskId }),
+      });
+      showToast("🗑️ 任务已删除");
+      failedSelectedIds.delete(taskId);
+      updateFailedSelectionUI();
+      refreshTasksList();
+    } else if (action === "open-folder") {
+      const res = await fetch("/api/tasks/open_folder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: taskId }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        showToast("⚠️ 未能定位到文件，可能文件已被移动");
+      }
+    }
+  });
+
+  // 失败项单项勾选代理
+  elDrawerTasksList.addEventListener("change", (e) => {
+    if (e.target.classList.contains("chk-failed-item")) {
+      const id = e.target.getAttribute("data-id");
+      if (e.target.checked) {
+        failedSelectedIds.add(id);
+      } else {
+        failedSelectedIds.delete(id);
+      }
+      updateFailedSelectionUI();
+    }
   });
 }
 
-// 6. 触发下载
+function updateFailedSelectionUI() {
+  const count = failedSelectedIds.size;
+  elFailedSelectedCount.textContent = count;
+  elBtnRetrySelected.classList.toggle("hidden", count === 0);
+  elBtnDeleteSelected.classList.toggle("hidden", count === 0);
+
+  const failedTasks = currentTasks.filter(t => t.status === "failed");
+  elChkFailedSelectAll.checked = failedTasks.length > 0 && failedTasks.every(t => failedSelectedIds.has(t.id));
+}
+
+// 6. 触发批量下载
 async function triggerDownload(bookIds) {
   if (!currentDownloadDir) {
     showToast("⚠️ 请先在上方设置并确认有效的下载根目录 (China12Books)！");
@@ -391,6 +611,8 @@ async function triggerDownload(bookIds) {
 
   showToast(`🚀 正在提交 ${bookIds.length} 本教材至下载队列...`);
   elDownloadDrawer.classList.remove("hidden");
+  // 切换到正在下载标签
+  elTabBtnDownloading.click();
 
   try {
     const res = await fetch("/api/download", {
@@ -400,7 +622,7 @@ async function triggerDownload(bookIds) {
     });
     const data = await res.json();
     if (data.success) {
-      showToast(`✅ 成功添加 ${data.added_count} 个下载任务，后台正在加速传输！`);
+      showToast(`✅ 成功添加 ${data.added_count} 个下载任务，正在稳定传输！`);
     } else {
       showToast(`❌ 提交下载失败: ${data.error}`);
     }
@@ -423,57 +645,74 @@ function initSSE() {
   };
 }
 
+// 8. 刷新下载列表展示 (按三大 Tab 精准过滤)
 function refreshTasksList() {
-  if (!currentTasks || currentTasks.length === 0) {
-    elDrawerTasksList.innerHTML = `<div class="empty-tasks">暂无下载任务，在主界面勾选课本后点击“批量下载”即可加入队列。</div>`;
-    elActiveBadge.textContent = "0";
-    elDrawerSummary.textContent = "0 个任务";
+  const downloadingTasks = currentTasks.filter(t => ["pending", "downloading", "paused"].includes(t.status));
+  const failedTasks = currentTasks.filter(t => t.status === "failed");
+  const completedTasks = currentTasks.filter(t => ["completed", "skipped"].includes(t.status));
+
+  // 更新徽章数字
+  elBadgeTabDownloading.textContent = downloadingTasks.length;
+  elBadgeTabFailed.textContent = failedTasks.length;
+  elBadgeTabCompleted.textContent = completedTasks.length;
+
+  const activeDownloading = currentTasks.filter(t => t.status === "downloading").length;
+  elActiveBadge.textContent = activeDownloading || downloadingTasks.length;
+  elDrawerSummary.textContent = `进行中: ${downloadingTasks.length} | 失败: ${failedTasks.length} | 已完成: ${completedTasks.length}`;
+
+  if (currentDrawerTab === "downloading") {
+    renderDownloadingTab(downloadingTasks);
+  } else if (currentDrawerTab === "failed") {
+    renderFailedTab(failedTasks);
+  } else if (currentDrawerTab === "completed") {
+    renderCompletedTab(completedTasks);
+  }
+}
+
+function renderDownloadingTab(tasks) {
+  if (tasks.length === 0) {
+    elDrawerTasksList.innerHTML = `<div class="empty-tasks">暂无下载中或排队中的任务。<br>在主表格勾选课本后点击“批量下载”即可加入。</div>`;
     return;
   }
 
-  const activeCount = currentTasks.filter(t => t.status === "downloading" || t.status === "pending").length;
-  elActiveBadge.textContent = activeCount;
-  elDrawerSummary.textContent = `进行中: ${activeCount} | 总计: ${currentTasks.length}`;
-
   let html = "";
-  currentTasks.forEach(task => {
-    let statusBadgeClass = "task-status-downloading";
+  tasks.forEach(task => {
     let statusText = "下载中";
+    let statusClass = "task-status-downloading";
+    let actionBtnHtml = `<button class="task-btn" data-action="pause" data-id="${task.id}">⏸️ 暂停</button>`;
 
     if (task.status === "pending") {
       statusText = "排队中";
-      statusBadgeClass = "task-status-downloading";
-    } else if (task.status === "completed") {
-      statusText = "已归档";
-      statusBadgeClass = "task-status-completed";
-    } else if (task.status === "updated") {
-      statusText = "已更新(旧版归档)";
-      statusBadgeClass = "task-status-completed";
-    } else if (task.status === "skipped") {
-      statusText = "已存在(跳过)";
-      statusBadgeClass = "task-status-skipped";
-    } else if (task.status === "failed") {
-      statusText = "失败";
-      statusBadgeClass = "task-status-failed";
+      statusClass = "task-status-downloading";
+      actionBtnHtml = `<button class="task-btn" data-action="pause" data-id="${task.id}">⏸️ 暂停</button>`;
+    } else if (task.status === "paused") {
+      statusText = "已暂停";
+      statusClass = "task-status-paused";
+      actionBtnHtml = `<button class="task-btn task-btn-primary" data-action="resume" data-id="${task.id}">▶️ 恢复</button>`;
     }
 
     const downloadedMb = (task.downloaded_bytes / (1024 * 1024)).toFixed(1);
-    const totalMb = (task.total_bytes / (1024 * 1024)).toFixed(1);
+    const totalMb = task.total_bytes ? (task.total_bytes / (1024 * 1024)).toFixed(1) : "未知";
 
     html += `
       <div class="task-card">
         <div class="task-card-header">
-          <span class="task-card-title">${escapeHtml(task.filename)}</span>
-          <span class="task-status-tag ${statusBadgeClass}">${statusText}</span>
+          <div class="task-card-title-row">
+            <span class="task-status-tag ${statusClass}">${statusText}</span>
+            <span class="task-card-title">${escapeHtml(task.filename)}</span>
+          </div>
+          <div class="task-card-actions">
+            ${actionBtnHtml}
+            <button class="task-btn task-btn-danger" data-action="delete" data-id="${task.id}" title="删除该任务并清理未完成临时文件">🗑️ 删除</button>
+          </div>
         </div>
         <div class="progress-bar-bg">
           <div class="progress-bar-fill" style="width: ${task.percent}%;"></div>
         </div>
         <div class="task-card-footer">
           <span>${downloadedMb} MB / ${totalMb} MB (${task.percent}%)</span>
-          <span>${task.speed_formatted || (task.status === "completed" ? "100%" : "")}</span>
+          <span>${task.speed_formatted || ""}</span>
         </div>
-        ${task.error_msg ? `<div style="color:var(--danger);font-size:11px;">⚠️ ${escapeHtml(task.error_msg)}</div>` : ""}
       </div>
     `;
   });
@@ -481,6 +720,75 @@ function refreshTasksList() {
   elDrawerTasksList.innerHTML = html;
 }
 
+function renderFailedTab(tasks = null) {
+  const failedTasks = tasks || currentTasks.filter(t => t.status === "failed");
+  if (failedTasks.length === 0) {
+    elDrawerTasksList.innerHTML = `<div class="empty-tasks">太棒了！当前没有任何失败的任务。</div>`;
+    return;
+  }
+
+  let html = "";
+  failedTasks.forEach(task => {
+    const isChecked = failedSelectedIds.has(task.id) ? "checked" : "";
+    html += `
+      <div class="task-card" style="border-left: 3px solid var(--danger);">
+        <div class="task-card-header">
+          <div class="task-card-title-row">
+            <input type="checkbox" class="chk-failed-item" data-id="${task.id}" ${isChecked} />
+            <span class="task-status-tag task-status-failed">失败</span>
+            <span class="task-card-title">${escapeHtml(task.filename)}</span>
+          </div>
+          <div class="task-card-actions">
+            <button class="task-btn task-btn-primary" data-action="retry-single" data-id="${task.id}">🔄 重新下载</button>
+            <button class="task-btn task-btn-danger" data-action="delete" data-id="${task.id}" title="删除任务并删除对应的失败临时文件">🗑️ 删除</button>
+          </div>
+        </div>
+        <div style="color:var(--danger);font-size:12px;background:rgba(239,68,68,0.08);padding:6px 10px;border-radius:4px;">
+          ⚠️ 失败原因: ${escapeHtml(task.error_msg || "CDN 节点响应超时或拒绝")}
+        </div>
+      </div>
+    `;
+  });
+
+  elDrawerTasksList.innerHTML = html;
+}
+
+function renderCompletedTab(tasks) {
+  if (tasks.length === 0) {
+    elDrawerTasksList.innerHTML = `<div class="empty-tasks">暂无下载完成的任务。</div>`;
+    return;
+  }
+
+  let html = "";
+  tasks.forEach(task => {
+    const sizeMb = task.downloaded_bytes ? (task.downloaded_bytes / (1024 * 1024)).toFixed(1) + " MB" : "";
+    const isSkipped = task.status === "skipped";
+
+    html += `
+      <div class="task-card" style="border-left: 3px solid var(--success);">
+        <div class="task-card-header">
+          <div class="task-card-title-row">
+            <span class="task-status-tag ${isSkipped ? "task-status-skipped" : "task-status-completed"}">
+              ${isSkipped ? "已存在(跳过)" : "已归档"}
+            </span>
+            <span class="task-card-title">${escapeHtml(task.filename)}</span>
+          </div>
+          <div class="task-card-actions">
+            <button class="task-btn" data-action="open-folder" data-id="${task.id}" title="在访达中高亮定位该文件">📂 打开所在目录</button>
+          </div>
+        </div>
+        <div class="task-card-footer">
+          <span style="color:var(--text-sub);font-size:11px;">${escapeHtml(task.relative_path || "")}</span>
+          <span>${sizeMb}</span>
+        </div>
+      </div>
+    `;
+  });
+
+  elDrawerTasksList.innerHTML = html;
+}
+
+// 辅助工具函数
 function showToast(msg) {
   const container = document.getElementById("toast-container");
   const t = document.createElement("div");

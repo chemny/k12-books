@@ -235,13 +235,61 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, { success: true, added_count: addedCount });
     }
 
+    if (pathname === '/api/tasks/active') {
+      return sendJson(res, { has_active: DOWNLOAD_MANAGER.hasActiveTasks() });
+    }
+
+    if (pathname === '/api/tasks/pause') {
+      const paused = payload.id ? DOWNLOAD_MANAGER.pauseTask(payload.id) : DOWNLOAD_MANAGER.pauseAll();
+      return sendJson(res, { success: true, count: paused });
+    }
+
+    if (pathname === '/api/tasks/resume') {
+      const resumed = payload.id ? DOWNLOAD_MANAGER.resumeTask(payload.id) : DOWNLOAD_MANAGER.resumeAll();
+      return sendJson(res, { success: true, count: resumed });
+    }
+
+    if (pathname === '/api/tasks/retry') {
+      const retried = DOWNLOAD_MANAGER.retryFailedTasks(payload.task_ids || null);
+      return sendJson(res, { success: true, count: retried });
+    }
+
+    if (pathname === '/api/tasks/delete') {
+      if (payload.id) {
+        DOWNLOAD_MANAGER.deleteTask(payload.id);
+      } else if (payload.task_ids && Array.isArray(payload.task_ids)) {
+        DOWNLOAD_MANAGER.deleteBatchTasks(payload.task_ids);
+      }
+      return sendJson(res, { success: true });
+    }
+
+    if (pathname === '/api/tasks/clear_downloading') {
+      const count = DOWNLOAD_MANAGER.clearDownloadingTasks();
+      return sendJson(res, { success: true, count });
+    }
+
+    if (pathname === '/api/tasks/clear_failed') {
+      const count = DOWNLOAD_MANAGER.clearFailedTasks(payload.task_ids || null);
+      return sendJson(res, { success: true, count });
+    }
+
+    if (pathname === '/api/tasks/clear_completed') {
+      const count = DOWNLOAD_MANAGER.clearCompletedTasks();
+      return sendJson(res, { success: true, count });
+    }
+
+    if (pathname === '/api/tasks/open_folder') {
+      const ok = DOWNLOAD_MANAGER.openItemInFolder(payload.id);
+      return sendJson(res, { success: ok });
+    }
+
     if (pathname === '/api/tasks/clear') {
-      DOWNLOAD_MANAGER.clearCompleted();
+      DOWNLOAD_MANAGER.clearCompletedTasks();
       return sendJson(res, { success: true });
     }
 
     if (pathname === '/api/tasks/cancel') {
-      DOWNLOAD_MANAGER.cancelAll();
+      DOWNLOAD_MANAGER.pauseAll();
       return sendJson(res, { success: true });
     }
 
