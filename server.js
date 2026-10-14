@@ -18,6 +18,19 @@ const CURRENT_DIR = __dirname;
 const WEB_DIR = path.join(CURRENT_DIR, 'web');
 const CONFIG_FILE = path.join(os.homedir(), '.chinak12_downloader_config.json');
 
+process.on('uncaughtException', (err) => {
+  if (err && (err.code === 'ERR_STREAM_DESTROYED' || err.code === 'ECONNRESET' || err.message?.includes('stream was destroyed'))) {
+    return;
+  }
+  console.error('⚠️ [Server Process Exception]', err);
+});
+process.on('unhandledRejection', (reason) => {
+  if (reason && (reason.message === 'AbortError' || reason.code === 'ERR_STREAM_DESTROYED')) {
+    return;
+  }
+  console.error('⚠️ [Unhandled Rejection]', reason);
+});
+
 const DOWNLOAD_MANAGER = new DownloadManager(2);
 let CATALOG_DATA = null;
 

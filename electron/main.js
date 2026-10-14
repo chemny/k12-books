@@ -3,6 +3,20 @@ const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const path = require("path");
 const { runServer, server, DOWNLOAD_MANAGER } = require("../server");
 
+// 拦截并静默处理流中断与取消异常，杜绝弹出 Electron 系统报错弹窗
+process.on('uncaughtException', (err) => {
+  if (err && (err.code === 'ERR_STREAM_DESTROYED' || err.code === 'ECONNRESET' || err.message?.includes('stream was destroyed'))) {
+    return;
+  }
+  console.error('⚠️ [Main Process Exception]', err);
+});
+process.on('unhandledRejection', (reason) => {
+  if (reason && (reason.message === 'AbortError' || reason.code === 'ERR_STREAM_DESTROYED')) {
+    return;
+  }
+  console.error('⚠️ [Unhandled Rejection]', reason);
+});
+
 // 处理渲染进程请求打开本地文件夹选择对话框
 ipcMain.handle("select-directory", async (event, defaultPath) => {
   const win = BrowserWindow.getFocusedWindow() || mainWindow;

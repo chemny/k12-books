@@ -138,6 +138,8 @@ function streamDownloadToFile({
 
     let fileWriteStream = null;
     let timer = null;
+    let isCleanedUp = false;
+    let responseRef = null;
 
     const resetIdleTimer = () => {
       if (timer) clearTimeout(timer);
@@ -148,9 +150,27 @@ function streamDownloadToFile({
     };
 
     const cleanup = () => {
+      if (isCleanedUp) return;
+      isCleanedUp = true;
       if (timer) { clearTimeout(timer); timer = null; }
+
+      if (responseRef) {
+        try {
+          responseRef.removeAllListeners('data');
+          responseRef.removeAllListeners('end');
+          responseRef.removeAllListeners('error');
+          responseRef.destroy();
+        } catch (e) {}
+      }
+
+      try { req.destroy(); } catch (e) {}
+
       if (fileWriteStream) {
-        try { fileWriteStream.destroy(); } catch (e) {}
+        try {
+          if (!fileWriteStream.destroyed) {
+            fileWriteStream.destroy();
+          }
+        } catch (e) {}
       }
     };
 
@@ -163,6 +183,13 @@ function streamDownloadToFile({
       lookup: customDnsLookup,
       timeout: connectTimeoutMs,
     }, (res) => {
+      responseRef = res;
+
+      if (isCleanedUp || (signal && signal.aborted)) {
+        cleanup();
+        return reject(new Error('AbortError'));
+      }
+
       if (res.statusCode === 401 || res.statusCode === 403) {
         cleanup();
         return reject(new Error(`官方限制 (HTTP ${res.statusCode})`));
@@ -183,6 +210,11 @@ function streamDownloadToFile({
       let written = (res.statusCode === 206) ? existingBytes : 0;
       fileWriteStream = fs.createWriteStream(tempPartPath, { flags: fileFlags });
 
+      // 静默捕获文件流异常，杜绝 ERR_STREAM_DESTROYED 冒泡
+      fileWriteStream.on('error', (err) => {
+        cleanup();
+      });
+
       let isFirstChunk = (written === 0);
       let isValidPdf = true;
 
@@ -191,9 +223,8 @@ function streamDownloadToFile({
       res.on('data', (chunk) => {
         resetIdleTimer();
 
-        if (signal && signal.aborted) {
+        if (isCleanedUp || (signal && signal.aborted) || !fileWriteStream || fileWriteStream.destroyed || fileWriteStream.closed) {
           cleanup();
-          req.destroy();
           return reject(new Error('AbortError'));
         }
 
@@ -204,27 +235,37 @@ function streamDownloadToFile({
             if (chunk[0] !== 0x25 || chunk[1] !== 0x50 || chunk[2] !== 0x44 || chunk[3] !== 0x46) {
               isValidPdf = false;
               cleanup();
-              req.destroy();
               return reject(new Error('Invalid PDF magic header'));
             }
           }
         }
 
-        fileWriteStream.write(chunk);
-        written += chunk.length;
-        if (onProgress) {
-          onProgress(written, totalBytes);
+        try {
+          if (!fileWriteStream.destroyed && !fileWriteStream.closed) {
+            fileWriteStream.write(chunk);
+            written += chunk.length;
+            if (onProgress) {
+              onProgress(written, totalBytes);
+            }
+          }
+        } catch (err) {
+          cleanup();
         }
       });
 
       res.on('end', () => {
         if (timer) clearTimeout(timer);
-        fileWriteStream.end(() => {
-          if (!isValidPdf || written < 20 * 1024) {
-            return reject(new Error('File incomplete or invalid'));
-          }
-          resolve({ written, totalBytes });
-        });
+        if (isCleanedUp) return;
+        try {
+          fileWriteStream.end(() => {
+            if (!isValidPdf || written < 20 * 1024) {
+              return reject(new Error('File incomplete or invalid'));
+            }
+            resolve({ written, totalBytes });
+          });
+        } catch (e) {
+          cleanup();
+        }
       });
 
       res.on('error', (err) => {
@@ -236,14 +277,12 @@ function streamDownloadToFile({
     if (signal) {
       signal.addEventListener('abort', () => {
         cleanup();
-        req.destroy();
         reject(new Error('AbortError'));
       }, { once: true });
     }
 
     req.on('timeout', () => {
       cleanup();
-      req.destroy();
       reject(new Error('Connection timeout'));
     });
 
@@ -792,8 +831,17 @@ class DownloadManager {
     if (['pending', 'downloading', 'paused', 'failed'].includes(t.status)) {
       const tempPart = path.join(t.target_root, '.download_temp', `${t.id}.pdf.part`);
       const tempFinished = path.join(t.target_root, '.download_temp', `${t.id}.pdf`);
-      try { if (fs.existsSync(tempPart)) fs.unlinkSync(tempPart); } catch (e) {}
-      try { if (fs.existsSync(tempFinished)) fs.unlinkSync(tempFinished); } catch (e) {}
+      const safeUnlink = (p) => {
+        try {
+          if (fs.existsSync(p)) fs.unlinkSync(p);
+        } catch (e) {
+          setTimeout(() => {
+            try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (err) {}
+          }, 300);
+        }
+      };
+      safeUnlink(tempPart);
+      safeUnlink(tempFinished);
     }
     // 已经下载完整的书籍保留，不删除实际文件
 
