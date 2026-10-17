@@ -469,9 +469,50 @@ class DownloadManager {
       }
 
       const task = new TaskItem(item, targetRoot);
+      const targetPath = task.target_full_path;
+      const targetDir = path.dirname(targetPath);
+
+      // 快速核对：如果本地已有该书（或旧前缀命名文件），立即置为 skipped，绝不排入 pending 队列！
+      let alreadyOnDisk = false;
+      let matchedSize = 0;
+      if (fs.existsSync(targetPath)) {
+        const s = fs.statSync(targetPath).size;
+        if (task.total_bytes > 0 && Math.abs(s - task.total_bytes) <= (task.total_bytes * 0.05)) {
+          alreadyOnDisk = true;
+          matchedSize = s;
+        }
+      } else if (fs.existsSync(targetDir)) {
+        try {
+          const files = fs.readdirSync(targetDir);
+          for (const f of files) {
+            if (!f.endsWith('.pdf') || f.startsWith('.')) continue;
+            const fPath = path.join(targetDir, f);
+            const s = fs.statSync(fPath).size;
+            if (task.total_bytes > 0 && Math.abs(s - task.total_bytes) <= (task.total_bytes * 0.05)) {
+              const bCore = task.clean_title ? task.clean_title.replace(/^[（(][^）)]+[）)]/, '').trim() : '';
+              if ((task.edition_tag && f.includes(task.edition_tag)) || (bCore && f.includes(bCore))) {
+                fs.renameSync(fPath, targetPath);
+                alreadyOnDisk = true;
+                matchedSize = s;
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (alreadyOnDisk) {
+        task.status = 'skipped';
+        task.downloaded_bytes = matchedSize;
+        task.total_bytes = matchedSize;
+        task.finish_time = Date.now();
+      } else {
+        task.status = 'pending';
+        added++;
+      }
+
       this.tasks.set(bookId, task);
       this.taskOrder.push(bookId);
-      added++;
     }
 
     this.saveToStorage();
@@ -574,13 +615,28 @@ class DownloadManager {
         task.downloaded_bytes = localSize;
         return;
       } else {
-        // 平台新版本覆盖，原旧版本归档至 History 对应镜像
-        try {
-          archiveSingleFileToHistory(targetPath, targetRootPath);
-        } catch (e) {
-          console.warn(`⚠️ 归档旧版本失败: ${e.message}`);
-        }
+        console.warn(`⚠️ 本地文件大小(${localSize})与预期(${expectedSize})不匹配，判定为未完成残缺文件，准备重新下载`);
       }
+    } else if (fs.existsSync(targetDir)) {
+      // 检查目录内是否存在带历史前缀命名的同款文件
+      try {
+        const files = fs.readdirSync(targetDir);
+        for (const f of files) {
+          if (!f.endsWith('.pdf') || f.startsWith('.')) continue;
+          const fPath = path.join(targetDir, f);
+          const s = fs.statSync(fPath).size;
+          if (task.total_bytes > 0 && Math.abs(s - task.total_bytes) <= (task.total_bytes * 0.05)) {
+            const bCore = task.clean_title ? task.clean_title.replace(/^[（(][^）)]+[）)]/, '').trim() : '';
+            if ((task.edition_tag && f.includes(task.edition_tag)) || (bCore && f.includes(bCore))) {
+              fs.renameSync(fPath, targetPath);
+              task.status = 'skipped';
+              task.downloaded_bytes = s;
+              task.total_bytes = s;
+              return;
+            }
+          }
+        }
+      } catch (e) {}
     }
 
     // 2. 临时下载目录
@@ -932,6 +988,242 @@ class DownloadManager {
       }
     }
     return false;
+  }
+
+  // --- 本地教材核对与归档引擎 (严格遵循同目录同名规则与官网下架规则) ---
+  reconcileAndArchive(targetRoot, catalogBooks = null) {
+    if (!catalogBooks) {
+      const { loadCatalogData } = require('./catalog');
+      const cat = loadCatalogData();
+      catalogBooks = cat.books || [];
+    }
+
+    const targetRootPath = path.resolve(targetRoot);
+    if (!fs.existsSync(targetRootPath)) {
+      return { success: false, error: '指定的下载根目录不存在' };
+    }
+
+    const activeBooks = catalogBooks.filter(b => b.is_active && b.has_pdf);
+    const allBooks = catalogBooks;
+
+    // 1. 递归扫描本地磁盘上的所有实际存在的 PDF 文件（排除 History 目录与 .download_temp 目录）
+    const localFiles = [];
+    const scanDir = (dir) => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const ent of entries) {
+        if (ent.name.startsWith('.')) continue;
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+          if (ent.name !== 'History' && ent.name !== '.download_temp') {
+            scanDir(full);
+          }
+        } else if (ent.isFile() && ent.name.toLowerCase().endsWith('.pdf')) {
+          const stat = fs.statSync(full);
+          localFiles.push({
+            fullPath: full,
+            relPath: path.relative(targetRootPath, full),
+            dir: dir,
+            filename: ent.name,
+            size: stat.size,
+          });
+        }
+      }
+    };
+    scanDir(targetRootPath);
+
+    // 2. 按所在目录对本地文件进行归类（严格落实“同一个目录下的同名”）
+    const filesByDir = new Map();
+    for (const f of localFiles) {
+      if (!filesByDir.has(f.dir)) filesByDir.set(f.dir, []);
+      filesByDir.get(f.dir).push(f);
+    }
+
+    let keptActiveCount = 0;
+    let renamedCount = 0;
+    const rule1Archived = []; // 规则 1：同一个目录下的同名教材不是最新，归档
+    const rule2Archived = []; // 规则 2：官网已删除但本地拥有的，归档
+
+    // 辅助匹配函数：针对同一个目录，计算文件与官方在用教材的最佳匹配
+    const matchBestBook = (file, books) => {
+      let best = null;
+      let bestScore = -1;
+      let bestDiff = 999;
+
+      for (const b of books) {
+        let score = 0;
+        // 册次匹配 (上册/下册/全一册)
+        if (b.volume && file.filename.includes(b.volume)) score += 100;
+        else if (!b.volume && (file.filename.includes('全一册') || !file.filename.includes('册'))) score += 50;
+
+        // 修订版本标签匹配 (如 2022修订版)
+        if (b.edition_tag && file.filename.includes(b.edition_tag)) score += 50;
+
+        // 书名核心匹配
+        const bCore = (b.clean_title || b.title).replace(/^[（(][^）)]+[）)]/, '').replace(/^[^\s·]+版[（(][^）)]+[）)]/, '').trim();
+        if (bCore && file.filename.includes(bCore)) score += 80;
+
+        // 大小匹配容差 (5% 以内)
+        const diff = b.pdf_size ? Math.abs(file.size - b.pdf_size) / b.pdf_size : 1;
+        if (diff <= 0.05) score += 50;
+        if (diff <= 0.01) score += 20;
+
+        if (score > bestScore || (score === bestScore && diff < bestDiff)) {
+          bestScore = score;
+          bestDiff = diff;
+          best = b;
+        }
+      }
+      return { book: best, score: bestScore, diff: bestDiff };
+    };
+
+    // 3. 逐个目录执行同目录核对与归档
+    for (const [dir, files] of filesByDir.entries()) {
+      const relDir = path.relative(targetRootPath, dir);
+      const parts = relDir.split(path.sep);
+
+      // 找到属于该目录的官方最新在用教材 (考虑出版社目录命名的轻微别名差异)
+      const dirActiveBooks = activeBooks.filter(b => {
+        const bDir = path.dirname(path.join(targetRootPath, b.relative_path));
+        if (bDir === dir) return true;
+        return parts.length >= 4 && parts[0] === b.stage && parts[1] === b.subject && parts[3] === b.grade &&
+          (b.publisher_dir.includes(parts[2].replace(/-.*$/, '')) || parts[2].includes(b.version));
+      });
+
+      const claimedActiveBookIds = new Set();
+      const unclaimedFiles = [];
+
+      // 优先给与官方标准文件名完全一致的文件匹配
+      files.sort((a, b) => {
+        const aExact = dirActiveBooks.some(bk => bk.filename === a.filename);
+        const bExact = dirActiveBooks.some(bk => bk.filename === b.filename);
+        if (aExact !== bExact) return bExact ? 1 : -1;
+        return 0;
+      });
+
+      for (const file of files) {
+        const availableBooks = dirActiveBooks.filter(b => !claimedActiveBookIds.has(b.id));
+        const res = matchBestBook(file, availableBooks);
+
+        if (res.book && res.diff <= 0.05) {
+          claimedActiveBookIds.add(res.book.id);
+          keptActiveCount++;
+
+          const standardPath = path.join(dir, res.book.filename);
+          if (file.fullPath !== standardPath) {
+            try {
+              if (fs.existsSync(standardPath)) fs.unlinkSync(standardPath);
+              fs.renameSync(file.fullPath, standardPath);
+              file.fullPath = standardPath;
+              file.filename = res.book.filename;
+              renamedCount++;
+            } catch (e) {
+              console.warn(`重命名文件失败: ${e.message}`);
+            }
+          }
+
+          // 在任务管理器中同步或更新状态为 skipped (已存在跳过)
+          let t = this.tasks.get(res.book.id);
+          if (!t) {
+            t = new TaskItem(res.book, targetRootPath);
+            this.tasks.set(res.book.id, t);
+            this.taskOrder.push(res.book.id);
+          }
+          t.status = 'skipped';
+          t.downloaded_bytes = file.size;
+          t.total_bytes = file.size;
+          t.finish_time = Date.now();
+        } else {
+          unclaimedFiles.push(file);
+        }
+      }
+
+      // 处理该目录下剩余未匹配为当前最新官方教材的文件：
+      for (const file of unclaimedFiles) {
+        const dirAllBooks = allBooks.filter(b => {
+          const bDir = path.dirname(path.join(targetRootPath, b.relative_path));
+          if (bDir === dir) return true;
+          return parts.length >= 4 && parts[0] === b.stage && parts[1] === b.subject && parts[3] === b.grade;
+        });
+
+        // 规则 1：同一个目录下的同名教材不是最新，归档
+        // 判定：同目录下已有在用教材匹配同一课程书名，或者在历史书单中存在但属于非最新版(is_active === false)
+        const sameCourseActive = dirActiveBooks.find(b => {
+          const bCore = (b.clean_title || b.title).replace(/^[（(][^）)]+[）)]/, '').replace(/^[^\s·]+版[（(][^）)]+[）)]/, '').trim();
+          return bCore && file.filename.includes(bCore);
+        });
+
+        const matchAll = dirAllBooks.find(b => !b.is_active && (b.filename === file.filename || (b.pdf_size && Math.abs(file.size - b.pdf_size) <= (b.pdf_size * 0.05))));
+
+        if (sameCourseActive || matchAll) {
+          try {
+            const histTarget = archiveSingleFileToHistory(file.fullPath, targetRootPath);
+            rule1Archived.push({
+              filename: file.filename,
+              relPath: file.relPath,
+              dest: path.relative(targetRootPath, histTarget),
+              reason: sameCourseActive ? `同目录下已有最新在用版: ${sameCourseActive.filename}` : '同名教材非最新版 (已由最新版替代)'
+            });
+            if (matchAll && this.tasks.has(matchAll.id)) {
+              this.tasks.get(matchAll.id).status = 'archived';
+            }
+          } catch (e) {
+            console.warn(`⚠️ 规则1归档失败: ${file.relPath} -> ${e.message}`);
+          }
+        } else {
+          // 规则 2：官网已删除但我们有的，归档
+          try {
+            const histTarget = archiveSingleFileToHistory(file.fullPath, targetRootPath);
+            rule2Archived.push({
+              filename: file.filename,
+              relPath: file.relPath,
+              dest: path.relative(targetRootPath, histTarget),
+              reason: '官网当前目录已下架/不存在该资源'
+            });
+          } catch (e) {
+            console.warn(`⚠️ 规则2归档失败: ${file.relPath} -> ${e.message}`);
+          }
+        }
+      }
+    }
+
+    // 4. 清理移动后可能留下的空目录
+    try {
+      const cleanEmpty = (d) => {
+        if (!fs.existsSync(d)) return;
+        const items = fs.readdirSync(d);
+        for (const item of items) {
+          if (item === 'History' || item === '.download_temp' || item.startsWith('.')) continue;
+          const sub = path.join(d, item);
+          if (fs.statSync(sub).isDirectory()) {
+            cleanEmpty(sub);
+            try {
+              if (fs.readdirSync(sub).length === 0) {
+                fs.rmdirSync(sub);
+              }
+            } catch (err) {}
+          }
+        }
+      };
+      cleanEmpty(targetRootPath);
+    } catch (e) {}
+
+    // 5. 保存状态并广播通知
+    this.saveToStorage();
+    const result = {
+      success: true,
+      total_local_files: localFiles.length,
+      active_kept: keptActiveCount,
+      renamed_normalized: renamedCount,
+      rule1_archived: rule1Archived.length,
+      rule2_archived: rule2Archived.length,
+      total_archived: rule1Archived.length + rule2Archived.length,
+      missing_to_download: Math.max(0, activeBooks.length - keptActiveCount),
+      rule1_samples: rule1Archived.slice(0, 5),
+      rule2_samples: rule2Archived.slice(0, 5),
+    };
+
+    this.notify('reconcile_completed', result);
+    return result;
   }
 
   getAllTasks() {

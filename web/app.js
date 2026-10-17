@@ -13,6 +13,7 @@ let failedSelectedIds = new Set();
 
 // DOM 元素引用
 const elCatalogStatus = document.getElementById("catalog-status");
+const elBtnReconcileArchive = document.getElementById("btn-reconcile-archive");
 const elBtnFetchLatest = document.getElementById("btn-fetch-latest") || document.getElementById("btn-reindex");
 const elBadgeDlRunning = document.getElementById("badge-dl-running");
 const elBadgeDlFailed = document.getElementById("badge-dl-failed");
@@ -491,6 +492,49 @@ function setupEventListeners() {
     }
   }
 
+  // 核对本地教材与归档
+  if (elBtnReconcileArchive) {
+    elBtnReconcileArchive.addEventListener("click", async () => {
+      if (!currentDownloadDir) {
+        showToast("⚠️ 请先设置并确认有效的下载根目录");
+        return;
+      }
+      const ok = await showConfirmDialog({
+        title: "核对本地教材与归档确认",
+        message: `将按规则执行深度核对与归档：<br>
+        1. <b>同目录下同名教材不是最新，归档</b>：旧版本文件移至 <code>History/</code> 镜像目录；<br>
+        2. <b>官网已删除但本地拥有的，归档</b>：已下架历史教材移至 <code>History/</code> 镜像目录；<br>
+        3. <b>本地已存在的在用最新教材</b>：自动规范化命名并标记为已存在，无需重复下载。<br><br>
+        是否立即开始扫描与归档？`,
+        confirmText: "开始核对与归档",
+        cancelText: "取消"
+      });
+      if (!ok) return;
+
+      const originalText = elBtnReconcileArchive.textContent;
+      elBtnReconcileArchive.disabled = true;
+      elBtnReconcileArchive.textContent = "🔍 正在核对与归档...";
+      showToast("🔍 正在扫描本地目录，核对最新在用教材与历史归档...", 4000);
+
+      try {
+        const res = await fetch("/api/reconcile_and_archive", { method: "POST" });
+        const data = await res.json();
+        if (data.success) {
+          showToast(`📦 核对完成！本地保留最新教材: ${data.active_kept} 本，归档同目录非最新: ${data.rule1_archived} 本，归档已下架: ${data.rule2_archived} 本，待下载: ${data.missing_to_download} 本`, 7000);
+          await loadTasks();
+          refreshTasksList();
+        } else {
+          showToast(`⚠️ 核对失败: ${data.error || "未知错误"}`, 4000);
+        }
+      } catch (e) {
+        showToast(`❌ 网络请求失败: ${e.message}`, 4000);
+      } finally {
+        elBtnReconcileArchive.disabled = false;
+        elBtnReconcileArchive.textContent = originalText;
+      }
+    });
+  }
+
   // 表格多选事件
   elBooksTbody.addEventListener("change", (e) => {
     if (e.target.classList.contains("chk-book")) {
@@ -823,7 +867,7 @@ function initSSE() {
 function refreshTasksList() {
   const downloadingTasks = currentTasks.filter(t => ["pending", "downloading", "paused"].includes(t.status));
   const failedTasks = currentTasks.filter(t => t.status === "failed");
-  const completedTasks = currentTasks.filter(t => ["completed", "skipped"].includes(t.status));
+  const completedTasks = currentTasks.filter(t => ["completed", "skipped", "archived"].includes(t.status));
 
   // 更新徽章数字
   elBadgeTabDownloading.textContent = downloadingTasks.length;
@@ -975,15 +1019,22 @@ function renderCompletedTab(tasks) {
   let html = "";
   tasks.forEach(task => {
     const sizeMb = task.downloaded_bytes ? (task.downloaded_bytes / (1024 * 1024)).toFixed(1) + " MB" : "";
-    const isSkipped = task.status === "skipped";
+    let statusTagHtml = '<span class="task-status-tag task-status-completed">下载成功</span>';
+    let borderLeftColor = 'var(--success)';
+
+    if (task.status === "skipped") {
+      statusTagHtml = '<span class="task-status-tag task-status-skipped">已存在(跳过)</span>';
+      borderLeftColor = 'var(--purple, #a855f7)';
+    } else if (task.status === "archived") {
+      statusTagHtml = '<span class="task-status-tag task-status-archived">已归档</span>';
+      borderLeftColor = '#f59e0b';
+    }
 
     html += `
-      <div class="task-card" style="border-left: 3px solid var(--success);">
+      <div class="task-card" style="border-left: 3px solid ${borderLeftColor};">
         <div class="task-card-header">
           <div class="task-card-title-row">
-            <span class="task-status-tag ${isSkipped ? "task-status-skipped" : "task-status-completed"}">
-              ${isSkipped ? "已存在(跳过)" : "已归档"}
-            </span>
+            ${statusTagHtml}
             <span class="task-card-title">${escapeHtml(task.filename)}</span>
           </div>
           <div class="task-card-actions">

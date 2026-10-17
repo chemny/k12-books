@@ -314,6 +314,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/api/reconcile_and_archive') {
+      const cfg = getStoredConfig();
+      const targetRoot = cfg.download_dir || '';
+      if (!targetRoot || !fs.existsSync(targetRoot)) {
+        return sendJson(res, { error: '请先设置并确认有效的下载根目录！' }, 400);
+      }
+      if (!CATALOG_DATA) {
+        CATALOG_DATA = loadCatalogData();
+      }
+      try {
+        const result = DOWNLOAD_MANAGER.reconcileAndArchive(targetRoot, CATALOG_DATA.books);
+        return sendJson(res, result);
+      } catch (err) {
+        return sendJson(res, { error: `核对归档异常: ${err.message}` }, 500);
+      }
+    }
+
     if (pathname === '/api/download') {
       const cfg = getStoredConfig();
       const targetRoot = cfg.download_dir || '';
