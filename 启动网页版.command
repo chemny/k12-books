@@ -1,5 +1,5 @@
 #!/bin/bash
-# 双击此脚本直接启动 ChinaK12BookDownLoader Web 服务并在浏览器打开
+# 双击此脚本直接启动 K12 Books Web 服务并在浏览器打开
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 

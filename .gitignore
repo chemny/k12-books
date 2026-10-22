@@ -1,8 +1,53 @@
-# 临时与下载缓存
-.download_temp/
+# 教材、下载文件及校验记录（不入库）
 *.pdf
+*.PDF
+*.pdf.*
+*.PDF.*
+*.pptx
+*.PPTX
 *.part
+*.download.json
+.download_temp/
+History/
+China12Books/
+ChinaK12Books/
+downloads/
+
+# 本地配置、凭据、日志与运行状态
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 *.log
+*.jsonl
+config.json
+tasks.json
+catalog.previous.json
+catalog-renditions.json
+state/
+.chinak12-downloader/
+.chinak12_downloader_*
+.cache/
+
+# 当前 docs 仅含本地验收记录、实验截图和测试结果，全部保留本地
+/docs/
+coverage/
+test-results/
+playwright-report/
+*.tmp
+*.bak
+
+# 本地 Agent / 编辑器资料
+.codex/
+.claude/
+.agents/
+AGENTS.md
+.idea/
+.vscode/
+.DS_Store
 
 # Python
 __pycache__/
@@ -10,8 +55,13 @@ __pycache__/
 .venv/
 venv/
 
-# Node & Electron
+# Node / Electron 与安装产物
 node_modules/
 dist/
-.idea/
-.DS_Store
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.zip
+*.exe
+*.blockmap

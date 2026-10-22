@@ -1,4 +1,4 @@
-name: Release ChinaK12BookDownLoader
+name: Release K12 Books
 
 on:
   push:
@@ -124,7 +124,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: chinak12-downloader-${{ matrix.name }}
+          name: k12-books-${{ matrix.name }}
           retention-days: 7
           if-no-files-found: error
           path: |

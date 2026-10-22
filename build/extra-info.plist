@@ -4,23 +4,23 @@
 <dict>
     <!-- 外接磁盘与可移动卷访问权限 (核心) -->
     <key>NSRemovableVolumesUsageDescription</key>
-    <string>ChinaK12BookDownLoader 需要访问外接移动磁盘以读取和保存教材资源。</string>
+    <string>K12 Books 需要访问外接移动磁盘以读取和保存教材资源。</string>
 
     <!-- 本地常用目录与文件访问权限 -->
     <key>NSFileReadWriteUsageDescription</key>
-    <string>ChinaK12BookDownLoader 需要读写文件以保存和归档教材。</string>
+    <string>K12 Books 需要读写文件以保存和归档教材。</string>
     <key>NSDocumentsFolderUsageDescription</key>
-    <string>ChinaK12BookDownLoader 需要访问文稿文件夹以保存教材。</string>
+    <string>K12 Books 需要访问文稿文件夹以保存教材。</string>
     <key>NSDownloadsFolderUsageDescription</key>
-    <string>ChinaK12BookDownLoader 需要访问下载文件夹以存储下载的课本。</string>
+    <string>K12 Books 需要访问下载文件夹以存储下载的课本。</string>
     <key>NSDesktopFolderUsageDescription</key>
-    <string>ChinaK12BookDownLoader 需要访问桌面文件夹以读取或保存教材。</string>
+    <string>K12 Books 需要访问桌面文件夹以读取或保存教材。</string>
     <key>NSNetworkVolumesUsageDescription</key>
-    <string>ChinaK12BookDownLoader 需要访问网络共享卷以读取和保存教材。</string>
+    <string>K12 Books 需要访问网络共享卷以读取和保存教材。</string>
 
     <!-- 本地通信与网络权限 -->
     <key>NSLocalNetworkUsageDescription</key>
-    <string>ChinaK12BookDownLoader 需要访问本地网络以与内置下载管理服务通信。</string>
+    <string>K12 Books 需要访问本地网络以与内置下载管理服务通信。</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>
@@ -34,7 +34,7 @@
     <key>CFBundleIdentifier</key>
     <string>com.chinak12.downloader</string>
     <key>CFBundleDisplayName</key>
-    <string>ChinaK12BookDownLoader</string>
+    <string>K12 Books</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.education</string>
 </dict>

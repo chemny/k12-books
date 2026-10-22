@@ -6,6 +6,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
 });
 
 window.addEventListener("DOMContentLoaded", () => {
-  console.log("ChinaK12BookDownLoader Electron 容器已初始化。");
+  console.log("K12 Books Electron 容器已初始化。");
 });
 

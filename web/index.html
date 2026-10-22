@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ChinaK12BookDownLoader - 教材下载器</title>
+  <title>K12 Books</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -12,23 +12,24 @@
     <div class="brand">
       <div class="brand-icon">📚</div>
       <div>
-        <h1>教材下载器</h1>
-        <span class="sub">国家中小学智慧教育平台 · 电子教材</span>
+        <h1>K12 Books</h1>
+
       </div>
     </div>
     <div class="topbar-right">
-      <span id="catalog-status" class="status-pill status-ready">目录已就绪</span>
-      <span style="font-size:12px;color:#a5b4fc;background:#1e1b4b;border:1px solid #4338ca;padding:3px 8px;border-radius:6px;font-weight:500;">⚡ 严格限并发: 2</span>
-      <button id="btn-reconcile-archive" class="secondary-btn reconcile-btn" title="按规则核对本地同目录教材并执行归档：1. 同目录下同名非最新版归档至 History；2. 官网已下架教材归档至 History；3. 本地已有在用最新教材自动识别免重复下载">🔍 核对本地与归档</button>
-      <button id="btn-fetch-latest" class="ghost-btn fetch-btn" title="从国家中小学智慧教育平台同步获取最新教材信息">🔄 获取最新教材信息</button>
+
+
+      <button id="btn-reconcile-archive" class="secondary-btn reconcile-btn" title="按规则核对本地同目录教材并执行归档：1. 同目录下同名非最新版归档至 History；2. 官网已下架教材归档至 History；3. 本地已有在用最新教材自动识别免重复下载">核对与归档</button>
+      <button id="open-save-position" class="ghost-btn" onclick="document.getElementById('folder-dialog').showModal()">保存位置</button>
+      <button id="btn-fetch-latest" class="ghost-btn fetch-btn" title="从国家中小学智慧教育平台同步获取最新教材信息">检查更新</button>
       <button id="btn-toggle-drawer" class="primary-btn drawer-btn" title="查看下载管理器 (正在下载 / 失败 / 已完成)">
-        <span>📥 下载列表</span>
+        <span>下载任务</span>
         <span class="dl-badge-group">
-          (<span id="badge-dl-running" class="dl-num-running" title="正在下载（含下载中、排队中、暂停）">0</span>
-          <span class="dl-badge-slash">/</span>
-          <span id="badge-dl-failed" class="dl-num-failed" title="失败任务数">0</span>
-          <span class="dl-badge-slash">/</span>
-          <span id="badge-dl-completed" class="dl-num-completed" title="已完成任务数">0</span>)
+          <span class="task-label">进行中</span> <span id="badge-dl-running" class="dl-num-running" title="正在下载（含下载中、排队中、暂停）">—</span>
+          <span class="dl-badge-slash">· 失败</span>
+          <span id="badge-dl-failed" class="dl-num-failed" title="失败任务数">—</span>
+          <span class="dl-badge-slash">· 已完成</span>
+          <span id="badge-dl-completed" class="dl-num-completed" title="已完成任务数">—</span>
         </span>
       </button>
     </div>
@@ -36,33 +37,28 @@
 
   <main class="container">
     <!-- 下载根目录设置横幅 -->
-    <section class="config-banner" id="config-banner">
-      <div class="config-left">
-        <span class="config-icon">📁</span>
-        <div class="config-info">
-          <label for="input-download-dir" class="config-title">本地课本下载根目录 (China12Books)</label>
-          <div class="config-input-group">
-            <input type="text" id="input-download-dir" readonly placeholder="点击右侧按钮选择保存目录..." title="点击可选择保存目录" style="cursor: pointer;" />
-            <button id="btn-save-dir" class="action-btn">📁 选择保存目录</button>
-          </div>
-        </div>
-      </div>
-      <div class="config-right">
-        <div id="dir-status-pill" class="dir-pill dir-pending">未检测目录</div>
-      </div>
-    </section>
+
 
     <!-- 警示条 (当未设置下载目录时提示) -->
     <div id="dir-warning-alert" class="alert-bar alert-warning hidden">
-      ⚠️ 请先在上方设置并确认有效的下载根目录，设置后方可开启教材下载功能！
+      请选择保存位置。
     </div>
 
+    <section class="catalog-overview"><div class="overview-heading"><div><h2>目录概况</h2><span class="source">国家中小学智慧教育平台</span></div>      <span id="catalog-status" class="status-pill status-ready">目录已就绪</span></div><div class="overview-stats">        <span class="stat-tag">目录总数 <b id="stat-catalog-total">0</b></span>        <span class="stat-tag stat-green">去重后可下载 <b id="stat-downloadable">0</b></span>        <span class="stat-tag" title="当前目录中已识别的现行教材，按资源去重；不含旧版、归档、备份及其他 PDF，不受清空任务列表影响。">已下载教材（当前目录）<b id="stat-downloaded">—</b></span></div><details class="sync-detail"><summary>同步详情</summary><p id="catalog-sync-info" role="status"></p></details></section>
+
+
+
+    <div class="section-label"><h2>教材列表</h2>      <span style="font-size:12px;color:#a5b4fc;background:#1e1b4b;border:1px solid #4338ca;padding:3px 8px;border-radius:6px;font-weight:500;">同时下载 2 个</span></div>
     <!-- 筛选过滤区域 -->
     <section class="filters-card">
       <div class="filter-row primary-row">
         <label class="field">
           <span>学段</span>
           <select id="filter-stage"><option value="">全部学段</option></select>
+        </label>
+        <label class="field">
+          <span>年级</span>
+          <select id="filter-grade"><option value="">全部年级</option></select>
         </label>
         <label class="field">
           <span>学科</span>
@@ -72,62 +68,45 @@
           <span>版本</span>
           <select id="filter-version"><option value="">全部版本</option></select>
         </label>
-        <label class="field">
-          <span>年级</span>
-          <select id="filter-grade"><option value="">全部年级</option></select>
-        </label>
+
       </div>
 
       <div class="filter-row secondary-row">
+
         <label class="field small-field">
           <span>册次</span>
           <select id="filter-volume"><option value="">全部册次</option></select>
         </label>
         <label class="field small-field">
+          <span>修订版</span>
+          <select id="filter-edition"><option value="">全部修订版</option></select>
+        </label>
+        <label class="field small-field">
           <span>格式</span>
           <select id="filter-format">
-            <option value="all">全部</option>
-            <option value="pdf" selected>PDF</option>
-            <option value="pptx">PowerPoint 课件</option>
+            <option value="all">全部格式</option>
+            <option value="pdf" selected>PDF</option><option value="pptx">PowerPoint 课件</option>
+
           </select>
         </label>
         <label class="field small-field">
           <span>资源状态</span>
           <select id="filter-status">
             <option value="all">全部</option>
-            <option value="downloadable" selected>可下载</option>
+            <option value="downloadable">可下载</option>
           </select>
         </label>
         <label class="field search-field">
           <span>搜索书名</span>
-          <input type="text" id="filter-search" placeholder="例如: 道德与法治 一年级 或 数学" />
+          <input type="text" id="filter-search" placeholder="输入书名或出版社" />
         </label>
         <button id="btn-reset-filters" class="ghost-btn reset-btn">清除筛选</button>
       </div>
     </section>
 
+    <div class="result-heading"><div class="result-count">        <strong id="filtered-total" class="highlight-num">0</strong> 个资源</div><div class="result-tools">        <span class="stat-tag stat-purple">当前筛选匹配 <b id="stat-current-matched">0</b></span>    <label style="font-size:13px;color:var(--text-sub)"><input type="checkbox" id="filter-changed-only" disabled> 仅看新增或变更</label><label class="range-label">目录范围<select id="catalog-scope"><option value="active">去重后目录</option><option value="all">全部目录</option></select></label></div></div>
     <!-- 统计与批量操作工具栏 -->
-    <section class="action-bar">
-      <div class="stats-summary">
-        <strong id="filtered-total" class="highlight-num">0</strong> 个资源
-        <span class="stat-tag stat-green">可下载 <b id="stat-downloadable">0</b></span>
-        <span class="stat-tag stat-purple">当前筛选匹配 <b id="stat-current-matched">0</b></span>
-      </div>
 
-      <div class="batch-controls">
-        <label class="checkbox-label" id="label-select-page">
-          <input type="checkbox" id="chk-select-page" />
-          <span>选中本页 (<span id="page-count-num">0</span>)</span>
-        </label>
-        <label class="checkbox-label" id="label-select-all-filtered">
-          <input type="checkbox" id="chk-select-all-filtered" />
-          <span>全选筛选结果 (<span id="all-filtered-num">0</span> 本)</span>
-        </label>
-        <button id="btn-batch-download" class="primary-btn batch-download-btn">
-          🚀 批量下载选中的教材 (<span id="selected-total-num">0</span> 本)
-        </button>
-      </div>
-    </section>
 
     <!-- 教材列表表格 -->
     <section class="table-container">
@@ -149,13 +128,30 @@
     </section>
 
     <!-- 分页控件 -->
-    <div class="pagination-bar">
+    <div class="pagination-bar"><label class="page-size">每页 <select id="page-size"><option>20</option><option>50</option><option>100</option></select> 条</label>
       <div class="page-info">第 <span id="cur-page-num">1</span> / <span id="total-page-num">1</span> 页</div>
       <div class="page-btns">
         <button id="btn-prev-page" class="ghost-btn">上一页</button>
         <button id="btn-next-page" class="ghost-btn">下一页</button>
       </div>
     </div>
+    <section class="action-bar">
+
+
+      <div class="batch-controls">
+        <label class="checkbox-label" id="label-select-page">
+          <input type="checkbox" id="chk-select-page" />
+          <span>选中本页 (<span id="page-count-num">0</span>)</span>
+        </label>
+        <label class="checkbox-label" id="label-select-all-filtered">
+          <input type="checkbox" id="chk-select-all-filtered" />
+          <span>全选筛选结果 (<span id="all-filtered-num">0</span> 本)</span>
+        </label>
+        <button id="btn-batch-download" class="primary-btn batch-download-btn">
+          下载所选 (<span id="selected-total-num">0</span> 本)
+        </button>
+      </div>
+    </section>
   </main>
 
   <!-- 右侧抽屉：下载任务管理器 (支持 3 标签页分类与精细化管控) -->
@@ -163,7 +159,7 @@
     <div class="drawer-header">
       <div class="drawer-title">
         <h3>📥 下载任务管理器 <span style="font-size:11px;font-weight:normal;background:#1e1b4b;color:#a5b4fc;border:1px solid #4338ca;padding:2px 6px;border-radius:4px;margin-left:6px;">限并发: 2</span></h3>
-        <span id="drawer-summary" class="drawer-sub">0 个任务</span>
+        <span id="drawer-summary" class="drawer-sub">正在加载任务…</span>
       </div>
       <button id="btn-close-drawer" class="icon-btn" title="关闭面板">✕</button>
     </div>
@@ -171,13 +167,13 @@
     <!-- 三大标签页导航栏 -->
     <div class="drawer-tabs">
       <button class="drawer-tab active" id="tab-btn-downloading" data-tab="downloading">
-        正在下载 <span id="badge-tab-downloading" class="tab-badge">0</span>
+        正在下载 <span id="badge-tab-downloading" class="tab-badge">—</span>
       </button>
       <button class="drawer-tab" id="tab-btn-failed" data-tab="failed">
-        下载失败 <span id="badge-tab-failed" class="tab-badge badge-danger">0</span>
+        下载失败 <span id="badge-tab-failed" class="tab-badge badge-danger">—</span>
       </button>
       <button class="drawer-tab" id="tab-btn-completed" data-tab="completed">
-        下载成功 <span id="badge-tab-completed" class="tab-badge badge-success">0</span>
+        下载成功 <span id="badge-tab-completed" class="tab-badge badge-success">—</span>
       </button>
     </div>
 
@@ -238,6 +234,23 @@
   <!-- 浮动弹窗提示 (Toast) -->
   <div id="toast-container" class="toast-container"></div>
 
+  <dialog id="folder-dialog"><div class="folder-heading"><h2>保存位置</h2><button onclick="document.getElementById('folder-dialog').close()" aria-label="关闭保存位置">×</button></div>    <section class="config-banner" id="config-banner">
+      <div class="config-left">
+        <span class="config-icon">📁</span>
+        <div class="config-info">
+          <label for="input-download-dir" class="config-title">保存位置</label>
+          <div class="config-input-group">
+            <input type="text" id="input-download-dir" readonly placeholder="请选择文件夹" title="点击可选择保存目录" style="cursor: pointer;" />
+            <button id="btn-save-dir" class="action-btn">浏览文件夹</button>
+          </div>
+        </div>
+      </div>
+      <div class="config-right">
+        <div id="dir-status-pill" class="dir-pill dir-pending">未检测目录</div>
+      </div>
+    </section><div class="folder-footer"><button class="ghost-btn" onclick="document.getElementById('folder-dialog').close()">关闭</button></div></dialog>
+<script src="/filters.js"></script>
   <script src="/app.js"></script>
+
 </body>
 </html>

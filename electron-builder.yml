@@ -1,5 +1,5 @@
 appId: com.chinak12.downloader
-productName: ChinaK12BookDownLoader
+productName: K12 Books
 copyright: Copyright © 2026 scottcheng
 
 directories:
@@ -24,16 +24,16 @@ files:
 asar: true
 
 mac:
-  artifactName: 'chinak12-downloader-mac-${arch}-${version}.${ext}'
+  artifactName: 'k12-books-mac-${arch}-${version}.${ext}'
   category: public.app-category.education
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
-    NSRemovableVolumesUsageDescription: 'ChinaK12BookDownLoader 需要访问外接移动磁盘以读取和保存教材资源。'
-    NSDocumentsFolderUsageDescription: 'ChinaK12BookDownLoader 需要访问文稿文件夹以保存教材。'
-    NSDownloadsFolderUsageDescription: 'ChinaK12BookDownLoader 需要访问下载文件夹以存储下载的课本。'
-    NSDesktopFolderUsageDescription: 'ChinaK12BookDownLoader 需要访问桌面文件夹以读取或保存教材。'
-    NSLocalNetworkUsageDescription: 'ChinaK12BookDownLoader 需要访问本地网络以与内置下载管理服务通信。'
+    NSRemovableVolumesUsageDescription: 'K12 Books 需要访问外接移动磁盘以读取和保存教材资源。'
+    NSDocumentsFolderUsageDescription: 'K12 Books 需要访问文稿文件夹以保存教材。'
+    NSDownloadsFolderUsageDescription: 'K12 Books 需要访问下载文件夹以存储下载的课本。'
+    NSDesktopFolderUsageDescription: 'K12 Books 需要访问桌面文件夹以读取或保存教材。'
+    NSLocalNetworkUsageDescription: 'K12 Books 需要访问本地网络以与内置下载管理服务通信。'
   icon: build/icon.icns
   notarize: false
   target:
@@ -41,7 +41,7 @@ mac:
     - zip
 
 dmg:
-  artifactName: 'chinak12-downloader-mac-${arch}-${version}.${ext}'
+  artifactName: 'k12-books-mac-${arch}-${version}.${ext}'
   contents:
     - x: 410
       y: 240
@@ -52,15 +52,15 @@ dmg:
       type: file
 
 win:
-  executableName: ChinaK12BookDownLoader
-  artifactName: 'chinak12-downloader-win-${arch}-${version}.${ext}'
+  executableName: K12 Books
+  artifactName: 'k12-books-win-${arch}-${version}.${ext}'
   icon: build/icon.ico
   target:
     - target: nsis
     - target: zip
 
 nsis:
-  artifactName: 'chinak12-downloader-win-${arch}-${version}-setup.${ext}'
+  artifactName: 'k12-books-win-${arch}-${version}-setup.${ext}'
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: true
@@ -70,15 +70,15 @@ nsis:
   perMachine: false
 
 linux:
-  executableName: chinak12-downloader
-  artifactName: 'chinak12-downloader-linux-${arch}-${version}.${ext}'
-  description: '国家中小学智慧教育平台 K12 教材可视化批量下载器与版本管理系统'
+  executableName: k12-books
+  artifactName: 'k12-books-linux-${arch}-${version}.${ext}'
+  description: 'K12 Books：国家中小学智慧教育平台教材下载与管理工具'
   maintainer: 'scott20201225'
   category: 'Education;Utility;'
   icon: build/icon.png
   desktop:
     entry:
-      StartupWMClass: 'ChinaK12BookDownLoader'
+      StartupWMClass: 'K12 Books'
   target:
     - AppImage
     - deb

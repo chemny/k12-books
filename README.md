@@ -1,111 +1,91 @@
-# ChinaK12BookDownLoader
+# K12 Books
 
-[![GitHub release](https://img.shields.io/github/v/release/scott20201225/ChinaK12BookDownLoader?color=3b82f6&logo=github)](https://github.com/scott20201225/ChinaK12BookDownLoader/releases/latest)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20|%20Windows%20|%20Linux-brightgreen)](https://github.com/scott20201225/ChinaK12BookDownLoader/releases)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/scott20201225/ChinaK12BookDownLoader?style=social)](https://github.com/scott20201225/ChinaK12BookDownLoader)
+**国家中小学智慧教育平台教材下载与管理工具。**
 
-> **国家中小学智慧教育平台（basic.smartedu.cn）K12 电子教材可视化批量下载器与版本归档管理系统**  
-> 界面精简直观、极简暗黑质感，支持按学段/学科/版本/年级多维级联筛选、**一键全选批量下载**、**前置秒级核对与毫秒跳过**、**同目录下同名旧版与下架资源 History 智能归档**、**严格双并发防封限流**。
+K12 Books 提供目录同步、教材筛选、批量下载和本地核对功能。下载官网发布的原始 PDF，保留文件内容。
 
-`#国家中小学智慧教育平台` `#电子教材下载器` `#电子课本` `#人教版` `#统编版` `#北师大版` `#苏教版` `#小学初中高中课本` `#教材PDF下载` `#智慧中小学`
+## 界面
 
----
+| 教材筛选 | 下载任务 |
+| --- | --- |
+| ![K12 Books 教材筛选](assets/preview-main.png) | ![K12 Books 下载任务](assets/preview-drawer.png) |
 
-## 📷 界面预览与功能展示
+## 功能
 
-| 教材主界面与多维级联筛选 | 实时下载管理器抽屉（限并发/速率/状态管理） |
-| :---: | :---: |
-| ![教材主界面与多维级联筛选](assets/preview-main.png) | ![实时下载任务管理器抽屉](assets/preview-drawer.png) |
+- **同步目录**：读取官网目录，展示新增、信息变更和本次未出现的资源；同步失败时保留上次成功目录。
+- **联动筛选**：学段、年级、学科、版本、册次与修订版联动，支持格式、资源状态及书名搜索。
+- **批量下载**：选择本页或全部筛选结果，最多同时下载 2 本；支持暂停、继续与失败重试。
+- **完整性校验**：检查 PDF 文件完整性和官网提供的有效整文件 MD5，保存本地校验记录，已校验的现有文件可跳过下载。
+- **任务管理**：查看下载中、失败和已完成任务，支持清空记录、删除未完成任务及打开文件所在目录。
+- **本地统计**：当前保存目录中的现行教材按资源去重，排除备份、旧版和归档；清空任务记录不影响已下载数量。
+- **核对与归档**：手动执行，将能够确认来源的旧版或已下架教材移至 `History/`，不覆盖已有归档；未知文件保留原位。
 
----
+目录同步不会自动下载、移动或归档教材。没有明确年份依据的教材标为“版本待确认”。
 
-## 🌟 核心特性
+## 启动网页版
 
-1. **可视化目录选择与安全防护**：
-   - 原生文件夹选择器，选择目录后自动生效；
-   - 未设置目录时强制禁止下载并高亮预警，避免下载到错误路径。
-
-2. **前置秒级核对与智能跳过（零重复流量）**：
-   - 点击批量下载瞬间，毫秒级扫描本地磁盘与目标路径；
-   - 本地已存在正版教材直接置为 `已存在(跳过)`，绝不推入排队队列空转；
-   - 自动识别历史旧格式命名前缀并就地规范化为标准官方名称。
-
-3. **严格的同目录同名教材归档（History 镜像存储）**：
-   - **规则 1：同一个目录下的同名教材不是最新，归档**：新旧版本并存时，旧版课标教材自动安全迁移至 `History/` 对应镜像路径，主目录仅保留官方最新版；
-   - **规则 2：官网已删除/下架但本地拥有的，归档**：历史资源自动迁移至 `History/` 镜像完整保存，绝不物理删除。
-
-4. **一键全选与严格限并发下载**：
-   - 支持勾选当前页及“全选筛选结果”，可一键将数千本课本加入下载队列；
-   - 底层严格锁死 2 个并发 Worker 并引入动态随机休眠，避免冲击官方 CDN 导致 IP 封禁或 403 拒绝。
-
-5. **实时三标签下载任务抽屉**：
-   - 顶部实时展示任务统计 `(正在下载 / 失败 / 已完成)`，点击即可滑出任务抽屉；
-   - 严格区分 `下载成功`（绿）、`已存在(跳过)`（紫）与 `已归档`（黄）；
-   - 支持单任务与全部暂停、恢复、批量重试、删除以及在访达/资源管理器中一键高亮定位。
-
----
-
-## 🚀 启动与使用方式
-
-### 方式一：Node.js Web 模式（零配置秒开）
+需要 **Node.js 18 或更新版本**。网页版使用 Node.js 内置模块，无需安装 Electron。
 
 ```bash
-cd ChinaK12BookDownLoader
+cd "K12 Books"
 node server.js 8080
 ```
-在浏览器打开：[http://127.0.0.1:8080](http://127.0.0.1:8080)
 
----
+打开 [http://127.0.0.1:8080](http://127.0.0.1:8080)，选择保存位置后即可筛选和下载教材。
 
-### 方式二：桌面客户端安装包（开箱即用）
+如果通过 Git 克隆，默认文件夹为 `k12-books`，进入该文件夹运行同一命令即可。macOS 也可双击“启动网页版.command”。
 
-进入 [Releases](https://github.com/scott20201225/ChinaK12BookDownLoader/releases) 页面直接下载对应系统的安装包：
+## 桌面版与打包
 
-| 操作系统 | 架构 | 安装包格式 |
-| :--- | :--- | :--- |
-| **macOS** | Apple Silicon (`arm64`) / Intel (`x64`) | `.dmg`、`.zip` |
-| **Windows** | 64位 (`x64`) / 骁龙 ARM64 (`arm64`) | 安装包 (`-setup.exe`)、便携版 (`.zip`) |
-| **Linux** | 64位 (`x64`) / 统信·麒麟·ARM64 (`arm64`) | `.AppImage`、`.deb`、`.tar.gz` |
-
----
-
-### 方式三：开发者模式与本地打包
+K12 Books 改名版本尚未发布安装包。目前可从源码运行或自行构建。
 
 ```bash
-cd ChinaK12BookDownLoader
-npm install
-
-# 运行桌面版
+npm ci
 npm start
 
-# 构建本地安装包
-npm run build:mac:arm64    # macOS Apple Silicon
-npm run build:mac:x64      # macOS Intel
-npm run build:win:x64      # Windows x64
-npm run build:win:arm64    # Windows ARM64
-npm run build:linux:x64    # Linux x64
-npm run build:linux:arm64  # Linux ARM64
+# 构建安装包
+npm run build:mac:arm64
+npm run build:mac:x64
+npm run build:win:x64
+npm run build:win:arm64
+npm run build:linux:x64
+npm run build:linux:arm64
 ```
 
----
+macOS 支持 `.dmg`、`.zip`；Windows 支持安装程序和便携版；Linux 支持 `.AppImage`、`.deb`、`.tar.gz`。实际构建依赖相应平台环境。
 
-## 📁 课本存放目录规范
+## 保存位置与数据
 
+教材按“学段 / 学科 / 版本与出版社 / 年级”分目录保存。保存位置可在界面中选择。
+
+程序配置、任务状态和日志默认存储在用户目录的 `.chinak12-downloader/`，沿用原项目的数据路径以保持兼容。可通过 `CHINAK12_DATA_DIR` 指定独立状态目录。
+
+仓库中的 `data/catalog_cache.json` 是官网教材目录元数据，不包含教材 PDF、个人下载记录或登录凭据；实际资源以官网更新结果为准。
+
+## 测试
+
+```bash
+npm test
 ```
-China12Books/
-├── 小学/
-│   ├── 数学/
-│   │   └── 人教版-人民教育出版社/
-│   │       └── 一年级/
-│   │           └── 义务教育教科书·数学一年级上册 [2022修订版].pdf
-│   └── 语文/
-├── 初中/
-├── 高中/
-└── History/                          <-- 官方下架/更新的历史版本镜像归档
-    └── 小学/
-        └── 数学/
-            └── 人教版-人民教育出版社/
-                └── 一年级/
-                    └── 义务教育教科书·数学一年级上册 [2012旧课标版].pdf
+
+自动化测试使用独立临时目录和受控测试数据，不操作用户的教材目录。
+
+可选的联网验证会在独立临时目录下载一本官网教材：
+
+```bash
+node scripts/verify-live.js
 ```
+
+可选的性能验证会生成独立批量测试数据：
+
+```bash
+node scripts/benchmark-local-processing.js
+```
+
+以上脚本的执行结果、教材文件及本地实验资料均不纳入仓库。
+
+## 项目来源与许可证声明
+
+K12 Books 基于 [scott20201225/ChinaK12BookDownLoader](https://github.com/scott20201225/ChinaK12BookDownLoader) 修改，原作者为 **scottcheng**。原项目的 `package.json` 声明许可证为 **MIT**，本项目保留该声明及原作者署名。
+
+当前版本完善了下载稳定性、目录完整性、筛选交互、任务反馈、本地统计和批量处理性能。

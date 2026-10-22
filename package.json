@@ -1,7 +1,8 @@
 {
-  "name": "chinak12-book-downloader",
+  "name": "k12-books",
+  "productName": "K12 Books",
   "version": "1.1.0",
-  "description": "国家中小学智慧教育平台 K12 教材可视化批量下载器与版本管理系统",
+  "description": "K12 Books：国家中小学智慧教育平台教材下载与管理工具",
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
@@ -17,7 +18,8 @@
     "build:linux": "electron-builder --linux --publish never",
     "build:linux:arm64": "electron-builder --linux AppImage deb tar.gz --arm64 --publish never",
     "build:linux:x64": "electron-builder --linux AppImage deb tar.gz --x64 --publish never",
-    "pack:mac": "electron-builder --mac --arm64 --dir"
+    "pack:mac": "electron-builder --mac --arm64 --dir",
+    "test": "node --test tests/*.test.js"
   },
   "keywords": [
     "国家中小学智慧教育平台",
@@ -43,5 +45,8 @@
     "electron": "^33.4.11",
     "electron-builder": "^26.15.3",
     "electron-packager": "^17.1.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

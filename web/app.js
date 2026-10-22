@@ -1,13 +1,19 @@
-// ChinaK12BookDownLoader 现代化前端交互引擎 (含三标签下载管理器与精准生命周期控制)
+// K12 Books 现代化前端交互引擎 (含三标签下载管理器与精准生命周期控制)
 
 let allBooks = [];
+let catalogChangedIds = new Set();
 let filteredBooks = [];
 let selectedBookIds = new Set();
 let currentDownloadDir = "";
 let currentPage = 1;
-const pageSize = 50;
+let pageSize = 20;
+const canDownloadBook = book => book.has_pdf && book.is_active;
 
 let currentTasks = [];
+let taskStorageError = null;
+let inventoryTimer = null;
+let lastInventoryKey = '';
+let inventoryRequest = 0;
 let currentDrawerTab = "downloading"; // "downloading" | "failed" | "completed"
 let failedSelectedIds = new Set();
 
@@ -28,6 +34,7 @@ const elFilterSubject = document.getElementById("filter-subject");
 const elFilterVersion = document.getElementById("filter-version");
 const elFilterGrade = document.getElementById("filter-grade");
 const elFilterVolume = document.getElementById("filter-volume");
+const elFilterEdition = document.getElementById("filter-edition");
 const elFilterFormat = document.getElementById("filter-format");
 const elFilterStatus = document.getElementById("filter-status");
 const elFilterSearch = document.getElementById("filter-search");
@@ -89,9 +96,9 @@ const elBtnClearCompleted = document.getElementById("btn-clear-completed");
 document.addEventListener("DOMContentLoaded", async () => {
   setupEventListeners();
   setupBeforeUnload();
-  await loadConfig();
-  await loadCatalog();
   initSSE();
+  await Promise.all([loadConfig(), loadCatalog()]);
+  window.addEventListener("focus", refreshInventory);
 });
 
 // 退出/关闭窗口安全提醒拦截
@@ -112,8 +119,11 @@ async function loadConfig() {
     const res = await fetch("/api/config");
     const cfg = await res.json();
     currentDownloadDir = cfg.download_dir || "";
+    document.getElementById('open-save-position').title = currentDownloadDir || '未设置';
     elInputDownloadDir.value = currentDownloadDir;
-    updateDirStatus(cfg.exists && currentDownloadDir.length > 0);
+    if (cfg.unsafe_app_dir) showToast('当前目录位于应用安装包内，请重新选择文稿或其他教材目录。', 8000);
+    refreshInventory();
+    updateDirStatus(cfg.exists && cfg.is_dir && !cfg.unsafe_app_dir && currentDownloadDir.length > 0);
   } catch (e) {
     console.error("加载配置失败:", e);
   }
@@ -121,7 +131,7 @@ async function loadConfig() {
 
 function updateDirStatus(isReady) {
   if (isReady) {
-    elDirStatusPill.textContent = "🟢 目录已就绪";
+    elDirStatusPill.textContent = "已设置";
     elDirStatusPill.className = "dir-pill dir-ready";
     elDirWarningAlert.classList.add("hidden");
     elBtnBatchDownload.disabled = false;
@@ -141,15 +151,10 @@ async function loadCatalog() {
     const data = await res.json();
 
     allBooks = data.books || [];
-    const activeCount = allBooks.filter(b => b.has_pdf && b.is_active).length;
-    elCatalogStatus.textContent = `✅ 目录已就绪 (${activeCount.toLocaleString()} 本在用教材)`;
+    elCatalogStatus.textContent = `目录已就绪`;
 
-    populateDropdown(elFilterStage, data.dimensions.stages);
-    populateDropdown(elFilterSubject, data.dimensions.subjects);
-    populateDropdown(elFilterVersion, data.dimensions.versions);
-    populateDropdown(elFilterGrade, data.dimensions.grades);
-    populateDropdown(elFilterVolume, data.dimensions.volumes);
-
+    updateCascade();
+    showCatalogSync(data);
     applyFilters();
   } catch (e) {
     elCatalogStatus.textContent = "❌ 目录加载失败";
@@ -171,6 +176,41 @@ function populateDropdown(selectEl, items, clearFirst = false) {
   });
 }
 
+function showCatalogSync(catalog) {
+  const el = document.getElementById('catalog-sync-info');
+  if (!el) return;
+  catalogChangedIds = new Set([...(catalog.sync?.changes?.added_ids || []), ...(catalog.sync?.changes?.changed_ids || [])]);
+  const changedOnly = document.getElementById('filter-changed-only');
+  changedOnly.disabled = catalogChangedIds.size === 0;
+  if (changedOnly.disabled) changedOnly.checked = false;
+  if (!catalog.sync?.checked_at) {
+    el.textContent = '缓存目录 · 尚未同步';
+    return;
+  }
+  const changes = catalog.sync.changes;
+  const stale = Date.now() - Date.parse(catalog.sync.checked_at) > 7 * 86400000 ? '目录超过 7 天未同步，建议检查官网更新。' : '';
+  el.textContent = `${stale}最近同步：${new Date(catalog.sync.checked_at).toLocaleString()} · 新增 ${changes.added} · 信息变更 ${changes.changed} · 本次未出现 ${changes.missing}${catalog.sync.initial_comparison ? '（含缓存校正）' : ''}`;
+}
+
+function updateCascade(changedKey = null) {
+  const controls = { stage: elFilterStage, grade: elFilterGrade, subject: elFilterSubject,
+    version: elFilterVersion, volume: elFilterVolume, edition_tag: elFilterEdition };
+  const selected = Object.fromEntries(Object.entries(controls).map(([key, el]) => [key, el.value]));
+  const includeHistory = document.getElementById("catalog-scope").value === "all";
+  const scopeBooks = allBooks.filter(book => includeHistory || book.is_active);
+  const result = TextbookFilters.cascade(scopeBooks, selected, changedKey, true);
+  for (const [key, el] of Object.entries(controls)) {
+    populateDropdown(el, result.options[key], true);
+    if (key === 'version') {
+      for (const option of [...el.options].slice(1)) {
+        const sample = allBooks.find(b => b.version === option.value && b.publisher_dir?.includes('-'));
+        if (sample) option.textContent = `${option.value} · ${sample.publisher_dir.split('-').slice(1).join('-')}`;
+      }
+    }
+    el.value = result.values[key];
+  }
+}
+
 // 3. 筛选过滤
 function applyFilters() {
   const stage = elFilterStage.value;
@@ -178,18 +218,21 @@ function applyFilters() {
   const version = elFilterVersion.value;
   const grade = elFilterGrade.value;
   const volume = elFilterVolume.value;
+  const edition = elFilterEdition.value;
   const format = elFilterFormat.value;
   const status = elFilterStatus.value;
   const search = elFilterSearch.value.trim().toLowerCase();
 
   filteredBooks = allBooks.filter(book => {
-    if (!book.is_active) return false;
+    if (document.getElementById("catalog-scope").value !== "all" && !book.is_active) return false;
+    if (document.getElementById('filter-changed-only').checked && !catalogChangedIds.has(book.id)) return false;
 
     if (stage && book.stage !== stage) return false;
     if (subject && book.subject !== subject) return false;
     if (version && book.version !== version) return false;
     if (grade && book.grade !== grade) return false;
     if (volume && book.volume !== volume) return false;
+    if (edition && book.edition_tag !== edition) return false;
 
     if (format === "pdf" && !book.has_pdf) return false;
     if (format === "pptx" && !book.has_pptx) return false;
@@ -211,11 +254,29 @@ function applyFilters() {
   renderTable();
 }
 
+async function refreshInventory() {
+  const request = ++inventoryRequest;
+  const el = document.getElementById('stat-downloaded');
+  try {
+    const res = await fetch('/api/inventory');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+    if (request !== inventoryRequest) return;
+    el.textContent = data.download_dir ? data.downloaded_pdf.toLocaleString() : '—';
+    el.title = `当前目录：${data.download_dir}；现行教材按资源去重，不含旧版、归档、备份及其他 PDF。`;
+  } catch (err) {
+    if (request !== inventoryRequest) return;
+    el.textContent = '读取失败';
+    el.title = err.message;
+  }
+}
+
 function updateStats() {
+  document.getElementById('stat-catalog-total').textContent = allBooks.length.toLocaleString();
   elFilteredTotal.textContent = filteredBooks.length.toLocaleString();
   elStatDownloadable.textContent = allBooks.filter(b => b.has_pdf && b.is_active).length.toLocaleString();
   elStatCurrentMatched.textContent = filteredBooks.length.toLocaleString();
-  elAllFilteredNum.textContent = filteredBooks.length.toLocaleString();
+  elAllFilteredNum.textContent = filteredBooks.filter(canDownloadBook).length.toLocaleString();
   elSelectedTotalNum.textContent = selectedBookIds.size.toLocaleString();
 }
 
@@ -229,7 +290,7 @@ function renderTable() {
 
   const startIdx = (currentPage - 1) * pageSize;
   const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
-  elPageCountNum.textContent = pageItems.length;
+  elPageCountNum.textContent = pageItems.filter(canDownloadBook).length;
 
   if (pageItems.length === 0) {
     elBooksTbody.innerHTML = `<tr><td colspan="6" class="loading-td">没有匹配的教材资源，请调整左上方筛选条件。</td></tr>`;
@@ -245,7 +306,7 @@ function renderTable() {
 
     html += `
       <tr class="${isChecked ? "row-selected" : ""}" data-id="${book.id}">
-        <td><input type="checkbox" class="chk-book" data-id="${book.id}" ${isChecked} /></td>
+        <td><input type="checkbox" class="chk-book" data-id="${book.id}" ${isChecked} ${canDownloadBook(book) ? "" : "disabled"} /></td>
         <td class="td-seq">${seqNum}</td>
         <td>
           <div class="book-title-cell">
@@ -259,10 +320,10 @@ function renderTable() {
           <span class="cat-pill cat-pub">${escapeHtml(book.publisher_dir.split("-")[0])}</span>
         </td>
         <td>
-          <span class="format-tag tag-pdf">PDF (${sizeMb})</span>
+          ${book.has_pdf ? `<span class="format-tag tag-pdf">PDF (${sizeMb})${book.is_active ? "" : " · 历史条目"}</span>` : `<span class="cat-pill">${book.kind === "course" ? "课程入口 · 无独立 PDF" : "未提供 PDF"}</span>`}
         </td>
         <td>
-          <button class="action-btn small-btn btn-single-dl" data-id="${book.id}">下载</button>
+          ${canDownloadBook(book) ? `<button class="action-btn small-btn btn-single-dl" data-id="${book.id}">下载</button>` : `<span>${book.has_pdf ? "已被新版替代" : "无独立 PDF"}</span>`}
         </td>
       </tr>
     `;
@@ -274,12 +335,12 @@ function renderTable() {
 
 // 统一同步全选/本页选态及显隐互斥联动
 function syncSelectionUI() {
-  const isAllFilteredSelected = filteredBooks.length > 0 && filteredBooks.every(b => selectedBookIds.has(b.id));
+  const isAllFilteredSelected = filteredBooks.some(canDownloadBook) && filteredBooks.filter(canDownloadBook).every(b => selectedBookIds.has(b.id));
 
   // 1. 全选筛选结果勾选框状态
   if (elChkSelectAllFiltered) {
     elChkSelectAllFiltered.checked = isAllFilteredSelected;
-    elChkSelectAllFiltered.disabled = filteredBooks.length === 0;
+    elChkSelectAllFiltered.disabled = !filteredBooks.some(canDownloadBook);
   }
 
   // 2. 交互互斥：当勾选全选筛选结果后，选中本页的勾选框隐藏；全选取消后，选中本页才展示
@@ -293,7 +354,7 @@ function syncSelectionUI() {
 
   // 3. 计算并更新当前页的选中状态 (本页复选框 与 表头全选复选框)
   const startIdx = (currentPage - 1) * pageSize;
-  const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
+  const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize).filter(canDownloadBook);
   const isPageAllSelected = pageItems.length > 0 && pageItems.every(b => selectedBookIds.has(b.id));
 
   if (elChkSelectPage) {
@@ -308,10 +369,23 @@ function syncSelectionUI() {
 
 // 5. 事件监听器绑定
 function setupEventListeners() {
+  document.getElementById('filter-changed-only').addEventListener('change', applyFilters);
   // 筛选事件
-  [elFilterStage, elFilterSubject, elFilterVersion, elFilterGrade, elFilterVolume, elFilterFormat, elFilterStatus].forEach(el => {
-    el.addEventListener("change", applyFilters);
+  const controls = { stage: elFilterStage, grade: elFilterGrade, subject: elFilterSubject,
+    version: elFilterVersion, volume: elFilterVolume, edition_tag: elFilterEdition };
+  Object.entries(controls).forEach(([key, el]) => el.addEventListener('change', () => {
+    selectedBookIds.clear();
+    updateCascade(key);
+    applyFilters();
+  }));
+  document.getElementById('catalog-scope').addEventListener('change', () => { selectedBookIds.clear(); updateCascade(); applyFilters(); });
+  document.getElementById('page-size').addEventListener('change', e => {
+    pageSize = Number(e.target.value);
+    currentPage = 1;
+    renderTable();
   });
+  elFilterFormat.addEventListener('change', () => { selectedBookIds.clear(); updateCascade(); applyFilters(); });
+  elFilterStatus.addEventListener('change', applyFilters);
   elFilterSearch.addEventListener("input", debounce(applyFilters, 300));
 
   elBtnResetFilters.addEventListener("click", () => {
@@ -320,9 +394,14 @@ function setupEventListeners() {
     elFilterVersion.value = "";
     elFilterGrade.value = "";
     elFilterVolume.value = "";
+    elFilterEdition.value = "";
     elFilterFormat.value = "pdf";
-    elFilterStatus.value = "downloadable";
+    elFilterStatus.value = "all";
+    document.getElementById("catalog-scope").value = "active";
     elFilterSearch.value = "";
+    document.getElementById('filter-changed-only').checked = false;
+    selectedBookIds.clear();
+    updateCascade();
     applyFilters();
   });
 
@@ -405,9 +484,12 @@ function setupEventListeners() {
       const data = await res.json();
       if (data.success) {
         currentDownloadDir = data.download_dir;
+        document.getElementById('open-save-position').title = currentDownloadDir;
+        document.getElementById('folder-dialog').close();
+        refreshInventory();
         elInputDownloadDir.value = currentDownloadDir;
         updateDirStatus(true);
-        showToast(`✅ 下载根目录已选择并自动生效: ${currentDownloadDir}`);
+        showToast("保存位置已设置");
       } else {
         showToast(`❌ 设置目录失败: ${data.error}`);
       }
@@ -463,16 +545,11 @@ function setupEventListeners() {
               const cat = payload.catalog;
               if (cat) {
                 allBooks = cat.books || [];
-                const activeCount = allBooks.filter(b => b.has_pdf && b.is_active).length;
-                elCatalogStatus.textContent = `✅ 目录已就绪 (${activeCount.toLocaleString()} 本在用教材)`;
+                            elCatalogStatus.textContent = `目录已就绪`;
 
-                // 重新填充筛选下拉框
-                populateDropdown(elFilterStage, cat.dimensions.stages, true);
-                populateDropdown(elFilterSubject, cat.dimensions.subjects, true);
-                populateDropdown(elFilterVersion, cat.dimensions.versions, true);
-                populateDropdown(elFilterGrade, cat.dimensions.grades, true);
-                populateDropdown(elFilterVolume, cat.dimensions.volumes, true);
-
+                selectedBookIds.clear();
+                updateCascade();
+                showCatalogSync(cat);
                 applyFilters();
               }
               showToast(`🎉 获取完成！${payload.message}`, 5000);
@@ -521,7 +598,8 @@ function setupEventListeners() {
         const data = await res.json();
         if (data.success) {
           showToast(`📦 核对完成！本地保留最新教材: ${data.active_kept} 本，归档同目录非最新: ${data.rule1_archived} 本，归档已下架: ${data.rule2_archived} 本，待下载: ${data.missing_to_download} 本`, 7000);
-          await loadTasks();
+          const tasksRes = await fetch('/api/tasks');
+          currentTasks = (await tasksRes.json()).tasks || [];
           refreshTasksList();
         } else {
           showToast(`⚠️ 核对失败: ${data.error || "未知错误"}`, 4000);
@@ -564,7 +642,7 @@ function setupEventListeners() {
   const togglePageSelection = (checked) => {
     const startIdx = (currentPage - 1) * pageSize;
     const pageItems = filteredBooks.slice(startIdx, startIdx + pageSize);
-    pageItems.forEach(b => {
+    pageItems.filter(canDownloadBook).forEach(b => {
       if (checked) selectedBookIds.add(b.id);
       else selectedBookIds.delete(b.id);
     });
@@ -583,8 +661,8 @@ function setupEventListeners() {
         return;
       }
       if (e.target.checked) {
-        filteredBooks.forEach(b => selectedBookIds.add(b.id));
-        showToast(`✨ 已全选当前筛选出的 ${filteredBooks.length} 本教材！`);
+        filteredBooks.filter(canDownloadBook).forEach(b => selectedBookIds.add(b.id));
+        showToast(`✨ 已全选当前筛选出的 ${filteredBooks.filter(canDownloadBook).length} 本教材！`);
       } else {
         filteredBooks.forEach(b => selectedBookIds.delete(b.id));
         showToast("已取消全选当前筛选结果");
@@ -659,23 +737,23 @@ function setupEventListeners() {
   });
 
   // --- 正在下载页操作 ---
-  elBtnPauseAll.addEventListener("click", async () => {
-    await fetch("/api/tasks/pause", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  elBtnPauseAll.addEventListener("click", taskAction(async () => {
+    await checkedTaskFetch("/api/tasks/pause", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     showToast("⏸️ 已暂停所有下载任务");
-  });
+  }));
 
-  elBtnResumeAll.addEventListener("click", async () => {
-    await fetch("/api/tasks/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  elBtnResumeAll.addEventListener("click", taskAction(async () => {
+    await checkedTaskFetch("/api/tasks/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     showToast("▶️ 已恢复所有下载任务");
-  });
+  }));
 
-  elBtnClearDownloading.addEventListener("click", async () => {
+  elBtnClearDownloading.addEventListener("click", taskAction(async () => {
     if (!confirm("确定要清空所有未完成的任务吗？\n下载中的临时文件将被删除，已下载完整的书籍将保留。")) return;
-    const res = await fetch("/api/tasks/clear_downloading", { method: "POST" });
+    const res = await checkedTaskFetch("/api/tasks/clear_downloading", { method: "POST" });
     const data = await res.json();
     showToast(`🗑️ 已清空 ${data.count || 0} 个未完成任务并清理临时文件`);
     refreshTasksList();
-  });
+  }));
 
   // --- 下载失败页操作 ---
   elChkFailedSelectAll.addEventListener("change", (e) => {
@@ -689,19 +767,19 @@ function setupEventListeners() {
     renderFailedTab();
   });
 
-  elBtnRetryAllFailed.addEventListener("click", async () => {
-    const res = await fetch("/api/tasks/retry", {
+  elBtnRetryAllFailed.addEventListener("click", taskAction(async () => {
+    const res = await checkedTaskFetch("/api/tasks/retry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
     const data = await res.json();
     showToast(`🔄 已将 ${data.count || 0} 个失败任务重新加入下载队列！`);
-  });
+  }));
 
-  elBtnRetrySelected.addEventListener("click", async () => {
+  elBtnRetrySelected.addEventListener("click", taskAction(async () => {
     if (failedSelectedIds.size === 0) return;
-    const res = await fetch("/api/tasks/retry", {
+    const res = await checkedTaskFetch("/api/tasks/retry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ task_ids: Array.from(failedSelectedIds) }),
@@ -710,22 +788,22 @@ function setupEventListeners() {
     showToast(`🔄 已重新加入 ${data.count || 0} 个选中任务`);
     failedSelectedIds.clear();
     updateFailedSelectionUI();
-  });
+  }));
 
-  elBtnClearFailed.addEventListener("click", async () => {
+  elBtnClearFailed.addEventListener("click", taskAction(async () => {
     if (!confirm("确定要清空所有失败任务吗？对应的失败/损坏文件将被删除。")) return;
-    const res = await fetch("/api/tasks/clear_failed", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const res = await checkedTaskFetch("/api/tasks/clear_failed", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     const data = await res.json();
     showToast(`🗑️ 已清除 ${data.count || 0} 个失败任务及临时文件`);
     failedSelectedIds.clear();
     updateFailedSelectionUI();
     refreshTasksList();
-  });
+  }));
 
-  elBtnDeleteSelected.addEventListener("click", async () => {
+  elBtnDeleteSelected.addEventListener("click", taskAction(async () => {
     if (failedSelectedIds.size === 0) return;
     if (!confirm(`确定要删除选中的 ${failedSelectedIds.size} 个失败任务吗？对应的失败文件将被删除。`)) return;
-    await fetch("/api/tasks/clear_failed", {
+    await checkedTaskFetch("/api/tasks/clear_failed", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ task_ids: Array.from(failedSelectedIds) }),
@@ -734,17 +812,17 @@ function setupEventListeners() {
     failedSelectedIds.clear();
     updateFailedSelectionUI();
     refreshTasksList();
-  });
+  }));
 
   // --- 下载成功页操作 ---
-  elBtnClearCompleted.addEventListener("click", async () => {
-    await fetch("/api/tasks/clear_completed", { method: "POST" });
+  elBtnClearCompleted.addEventListener("click", taskAction(async () => {
+    await checkedTaskFetch("/api/tasks/clear_completed", { method: "POST" });
     showToast("🗑️ 已清空已完成记录（本地文件完好保留）");
     refreshTasksList();
-  });
+  }));
 
   // --- 抽屉列表项按钮事件代理 ---
-  elDrawerTasksList.addEventListener("click", async (e) => {
+  elDrawerTasksList.addEventListener("click", taskAction(async (e) => {
     const btn = e.target.closest("button");
     if (!btn) return;
     const action = btn.getAttribute("data-action");
@@ -752,28 +830,28 @@ function setupEventListeners() {
     if (!action || !taskId) return;
 
     if (action === "pause") {
-      await fetch("/api/tasks/pause", {
+      await checkedTaskFetch("/api/tasks/pause", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: taskId }),
       });
       showToast("⏸️ 任务已暂停");
     } else if (action === "resume") {
-      await fetch("/api/tasks/resume", {
+      await checkedTaskFetch("/api/tasks/resume", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: taskId }),
       });
       showToast("▶️ 任务已恢复");
     } else if (action === "retry-single") {
-      await fetch("/api/tasks/retry", {
+      await checkedTaskFetch("/api/tasks/retry", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ task_ids: [taskId] }),
       });
       showToast("🔄 已加入重试队列");
     } else if (action === "delete") {
-      await fetch("/api/tasks/delete", {
+      await checkedTaskFetch("/api/tasks/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: taskId }),
@@ -783,7 +861,7 @@ function setupEventListeners() {
       updateFailedSelectionUI();
       refreshTasksList();
     } else if (action === "open-folder") {
-      const res = await fetch("/api/tasks/open_folder", {
+      const res = await checkedTaskFetch("/api/tasks/open_folder", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: taskId }),
@@ -793,7 +871,7 @@ function setupEventListeners() {
         showToast("⚠️ 未能定位到文件，可能文件已被移动");
       }
     }
-  });
+  }));
 
   // 失败项单项勾选代理
   elDrawerTasksList.addEventListener("change", (e) => {
@@ -819,11 +897,37 @@ function updateFailedSelectionUI() {
   elChkFailedSelectAll.checked = failedTasks.length > 0 && failedTasks.every(t => failedSelectedIds.has(t.id));
 }
 
+// 所有任务操作统一检查 HTTP 和业务结果，错误时不继续显示成功提示。
+async function checkedTaskFetch(url, options) {
+  let response;
+  try { response = await fetch(url, options); }
+  catch { throw new Error('无法连接服务，请稍后重试'); }
+  let data;
+  try { data = await response.clone().json(); }
+  catch { throw new Error('服务返回异常，请稍后重试'); }
+  if (!response.ok || data.success !== true) throw new Error(data.error || '操作失败，请稍后重试');
+  if (data.count === 0 || data.count === false) throw new Error('没有符合当前操作的任务，请刷新列表');
+  return response;
+}
+
+function taskAction(handler) {
+  return async event => {
+    try { await handler(event); }
+    catch (error) { showToast(`操作未完成：${error.message || '无法连接服务，请重试'}`, 8000); }
+  };
+}
+
+function updateTaskStorageError(error) {
+  if (error && error !== taskStorageError) showToast(error, 10000);
+  taskStorageError = error || null;
+  elBtnToggleDrawer.title = taskStorageError || '查看下载管理器 (正在下载 / 失败 / 已完成)';
+}
+
 // 6. 触发批量下载
 async function triggerDownload(bookIds) {
   if (!currentDownloadDir) {
-    showToast("⚠️ 请先在上方设置并确认有效的下载根目录 (China12Books)！");
-    elInputDownloadDir.focus();
+    showToast("请先选择保存位置。");
+    document.getElementById("folder-dialog").showModal();
     return;
   }
 
@@ -833,14 +937,14 @@ async function triggerDownload(bookIds) {
   elTabBtnDownloading.click();
 
   try {
-    const res = await fetch("/api/download", {
+    const res = await checkedTaskFetch("/api/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ book_ids: bookIds }),
     });
     const data = await res.json();
     if (data.success) {
-      showToast(`✅ 成功添加 ${data.added_count} 个下载任务，正在稳定传输！`);
+      showToast(data.added_count > 0 ? `已添加 ${data.added_count} 个下载任务` : '没有新增下载，请查看任务结果');
     } else {
       showToast(`❌ 提交下载失败: ${data.error}`);
     }
@@ -852,9 +956,17 @@ async function triggerDownload(bookIds) {
 // 7. SSE 实时长连接
 function initSSE() {
   const sse = new EventSource("/api/events");
+  sse.onerror = () => {
+    elDrawerSummary.textContent = "连接中断，正在重连…";
+  };
   sse.onmessage = (event) => {
     try {
       const payload = JSON.parse(event.data);
+      if (Object.prototype.hasOwnProperty.call(payload, 'storage_error')) updateTaskStorageError(payload.storage_error);
+      if (payload.type === 'storage_status') {
+        updateTaskStorageError(payload.data?.error);
+        refreshTasksList();
+      }
       if (payload.tasks) {
         currentTasks = payload.tasks;
         refreshTasksList();
@@ -865,6 +977,12 @@ function initSSE() {
 
 // 8. 刷新下载列表展示 (按三大 Tab 精准过滤)
 function refreshTasksList() {
+  const inventoryKey = currentTasks.filter(t => ['completed', 'skipped', 'archived'].includes(t.status)).map(t => t.id + ':' + t.status).sort().join('|');
+  if (inventoryKey !== lastInventoryKey) {
+    lastInventoryKey = inventoryKey;
+    clearTimeout(inventoryTimer);
+    inventoryTimer = setTimeout(refreshInventory, 300);
+  }
   const downloadingTasks = currentTasks.filter(t => ["pending", "downloading", "paused"].includes(t.status));
   const failedTasks = currentTasks.filter(t => t.status === "failed");
   const completedTasks = currentTasks.filter(t => ["completed", "skipped", "archived"].includes(t.status));
@@ -882,7 +1000,8 @@ function refreshTasksList() {
 
   const activeDownloading = currentTasks.filter(t => t.status === "downloading").length;
   const pendingCount = currentTasks.filter(t => t.status === "pending").length;
-  elDrawerSummary.textContent = `下载中: ${activeDownloading} | 排队中: ${pendingCount} | 失败: ${failedTasks.length} | 已完成: ${completedTasks.length}`;
+  elDrawerSummary.textContent = `下载中: ${activeDownloading} | 排队中: ${pendingCount} | 失败: ${failedTasks.length} | 已完成: ${completedTasks.length}${taskStorageError ? ' · ' + taskStorageError : ''}`;
+  elDrawerSummary.style.color = taskStorageError ? 'var(--danger)' : '';
 
   if (currentDrawerTab === "downloading") {
     renderDownloadingTab(downloadingTasks);
@@ -913,8 +1032,8 @@ function renderDownloadingTab(tasks) {
   const activeCount = tasks.filter(t => t.status === "downloading").length;
   html += `
     <div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
-      <span>🌐 底层活跃网络连接: <strong style="color:var(--primary);">${activeCount} / 2</strong></span>
-      <span style="color:var(--text-sub);font-size:11px;">(其余排队任务无任何网络流量)</span>
+      <span>同时下载： <strong style="color:var(--primary);">${activeCount} / 2</strong></span>
+      <span style="color:var(--text-sub);font-size:11px;"></span>
     </div>
   `;
 
@@ -932,18 +1051,18 @@ function renderDownloadingTab(tasks) {
       statusText = "🚀 正在下载";
       statusClass = "task-status-downloading";
       progressClass = "progress-bar-fill"; // 亮蓝色活动进度条
-      speedInfo = task.speed_formatted || "正在建立 CDN 传输...";
+      speedInfo = task.speed_formatted || "正在连接…";
     } else if (task.status === "pending") {
       statusText = "⏳ 队列等待中";
       statusClass = "task-status-pending";
       progressClass = "progress-bar-fill progress-bar-cached"; // 灰暗静态条
-      speedInfo = task.downloaded_bytes > 0 ? `断点缓存已存 ${downloadedMb} MB (未连接网络)` : "等待 Worker 拾取 (无网络)";
+      speedInfo = task.downloaded_bytes > 0 ? `断点缓存已存 ${downloadedMb} MB (未连接网络)` : "排队中";
       actionBtnHtml = `<button class="task-btn" data-action="pause" data-id="${task.id}">⏸️ 暂停</button>`;
     } else if (task.status === "paused") {
       statusText = "⏸️ 已暂停";
       statusClass = "task-status-paused";
       progressClass = "progress-bar-fill progress-bar-cached";
-      speedInfo = "任务已暂停 (无网络)";
+      speedInfo = "已暂停";
       actionBtnHtml = `<button class="task-btn task-btn-primary" data-action="resume" data-id="${task.id}">▶️ 恢复</button>`;
     }
 
@@ -952,7 +1071,7 @@ function renderDownloadingTab(tasks) {
         <div class="task-card-header">
           <div class="task-card-title-row">
             <span class="task-status-tag ${statusClass}">${statusText}</span>
-            <span class="task-card-title">${escapeHtml(task.filename)}</span>
+            <span class="task-card-title" title="${escapeHtml(task.filename)}">${escapeHtml(compactTaskName(task.filename))}</span>
           </div>
           <div class="task-card-actions">
             ${actionBtnHtml}
@@ -980,7 +1099,7 @@ function renderDownloadingTab(tasks) {
 function renderFailedTab(tasks = null) {
   const failedTasks = tasks || currentTasks.filter(t => t.status === "failed");
   if (failedTasks.length === 0) {
-    elDrawerTasksList.innerHTML = `<div class="empty-tasks">太棒了！当前没有任何失败的任务。</div>`;
+    elDrawerTasksList.innerHTML = `<div class="empty-tasks">暂无失败任务</div>`;
     return;
   }
 
@@ -993,7 +1112,7 @@ function renderFailedTab(tasks = null) {
           <div class="task-card-title-row">
             <input type="checkbox" class="chk-failed-item" data-id="${task.id}" ${isChecked} />
             <span class="task-status-tag task-status-failed">失败</span>
-            <span class="task-card-title">${escapeHtml(task.filename)}</span>
+            <span class="task-card-title" title="${escapeHtml(task.filename)}">${escapeHtml(compactTaskName(task.filename))}</span>
           </div>
           <div class="task-card-actions">
             <button class="task-btn task-btn-primary" data-action="retry-single" data-id="${task.id}">🔄 重新下载</button>
@@ -1008,6 +1127,16 @@ function renderFailedTab(tasks = null) {
   });
 
   elDrawerTasksList.innerHTML = html;
+}
+
+// 只压缩任务展示，下载文件名和实际目录保持原样。
+function compactTaskName(filename = "") {
+  return filename.replace(/^义务教育教科书[·•\s]*/, "");
+}
+
+function compactTaskLocation(relativePath = "") {
+  return relativePath.split(/[\\/]/).slice(0, -1).join(" · ")
+    .replace(/人民教育出版社/g, "人教社");
 }
 
 function renderCompletedTab(tasks) {
@@ -1031,18 +1160,18 @@ function renderCompletedTab(tasks) {
     }
 
     html += `
-      <div class="task-card" style="border-left: 3px solid ${borderLeftColor};">
+      <div class="task-card task-card-result" style="border-left: 3px solid ${borderLeftColor};">
         <div class="task-card-header">
           <div class="task-card-title-row">
             ${statusTagHtml}
-            <span class="task-card-title">${escapeHtml(task.filename)}</span>
+            <span class="task-card-title" title="${escapeHtml(task.filename)}">${escapeHtml(compactTaskName(task.filename))}</span>
           </div>
           <div class="task-card-actions">
-            <button class="task-btn" data-action="open-folder" data-id="${task.id}" title="在访达中高亮定位该文件">📂 打开所在目录</button>
+            <button class="task-btn" data-action="open-folder" data-id="${task.id}" title="在访达中高亮定位该文件">打开目录</button>
           </div>
         </div>
         <div class="task-card-footer">
-          <span style="color:var(--text-sub);font-size:11px;">${escapeHtml(task.relative_path || "")}</span>
+          <span class="task-location" title="${escapeHtml(task.relative_path || "")}">${escapeHtml(compactTaskLocation(task.relative_path))}</span>
           <span>${sizeMb}</span>
         </div>
       </div>

@@ -1,15 +1,11 @@
 #!/bin/bash
-# 双击此脚本直接启动 ChinaK12BookDownLoader 桌面客户端
+# 双击此脚本启动 K12 Books 桌面客户端
 DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="$DIR/dist/ChinaK12BookDownLoader-darwin-arm64/ChinaK12BookDownLoader.app"
-
-# 确保关闭旧残留进程，保证加载最新构建与严格 2 并发配置
-pkill -f "ChinaK12BookDownLoader" 2>/dev/null
-sleep 0.5
-
-if [ -d "$APP" ]; then
-    open "$APP"
-else
-    cd "$DIR"
-    npm start
-fi
+for APP in "$DIR/dist/mac-arm64/K12 Books.app" "$DIR/dist/mac/K12 Books.app" "$DIR/dist/mac-x64/K12 Books.app"; do
+    if [ -d "$APP" ]; then
+        open "$APP"
+        exit $?
+    fi
+done
+cd "$DIR" || exit 1
+npm start

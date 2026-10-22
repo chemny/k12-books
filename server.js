@@ -1,5 +1,5 @@
 /**
- * ChinaK12BookDownLoader 本地服务与 API 调度中心
+ * K12 Books 本地服务与 API 调度中心
  * =========================================================================
  * RESTful API、Server-Sent Events 实时事件流与前端静态资源托管。
  */
@@ -13,10 +13,14 @@ const { exec } = require('child_process');
 
 const { loadCatalogData, refreshCatalogFromPlatform } = require('./core/catalog');
 const { DownloadManager } = require('./core/downloader');
+const { countDownloadedPdfs } = require('./core/inventory');
+const { DATA_DIR, atomicWrite } = require('./core/storage');
 
 const CURRENT_DIR = __dirname;
 const WEB_DIR = path.join(CURRENT_DIR, 'web');
-const CONFIG_FILE = path.join(os.homedir(), '.chinak12_downloader_config.json');
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const LEGACY_CONFIG_FILE = path.join(os.homedir(), '.chinak12_downloader_config.json');
+function unsafeAppDir(dir) { return /\.app(?:[\\/]|$)/i.test(dir); }
 
 process.on('uncaughtException', (err) => {
   if (err && (err.code === 'ERR_STREAM_DESTROYED' || err.code === 'ECONNRESET' || err.message?.includes('stream was destroyed'))) {
@@ -47,23 +51,20 @@ function broadcastSSE(payload) {
 }
 
 function getStoredConfig() {
-  if (fs.existsSync(CONFIG_FILE)) {
+  const file = fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : process.env.CHINAK12_DATA_DIR ? CONFIG_FILE : LEGACY_CONFIG_FILE;
+  if (fs.existsSync(file)) {
     try {
-      return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+      return JSON.parse(fs.readFileSync(file, 'utf-8'));
     } catch (e) {
       // ignore
     }
   }
-  const defaultDir = path.resolve(CURRENT_DIR, '../China12Books');
+  const defaultDir = path.join(os.homedir(), 'Documents', 'China12Books');
   return { download_dir: defaultDir };
 }
 
 function saveStoredConfig(cfg) {
-  try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('⚠️ 保存配置失败:', e.message);
-  }
+  atomicWrite(CONFIG_FILE, cfg);
 }
 
 function sendJson(res, data, status = 200) {
@@ -74,6 +75,14 @@ function sendJson(res, data, status = 200) {
     'Access-Control-Allow-Origin': '*',
   });
   res.end(body);
+}
+
+function sendTaskResult(res, result, requiredChange = false) {
+  if (DOWNLOAD_MANAGER.storageError) {
+    return sendJson(res, { success: false, error: '操作已在当前会话生效，但' + DOWNLOAD_MANAGER.storageError }, 500);
+  }
+  if (requiredChange && !result.count) return sendJson(res, { success: false, error: '任务状态已变化或任务不存在，请刷新后重试' }, 409);
+  return sendJson(res, { success: true, ...result });
 }
 
 function serveStaticFile(res, filePath, contentType) {
@@ -107,13 +116,13 @@ function handleSSE(req, res) {
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
   });
-  res.write('\n');
+  res.write(`data: ${JSON.stringify({ type: 'snapshot', tasks: DOWNLOAD_MANAGER.getAllTasks(), storage_error: DOWNLOAD_MANAGER.storageError })}\n\n`);
 
   sseClients.add(res);
 
   const onEvent = (payload) => {
     try {
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...payload, tasks: DOWNLOAD_MANAGER.getAllTasks(), storage_error: DOWNLOAD_MANAGER.storageError })}\n\n`);
     } catch (e) {
       // client disconnected
     }
@@ -125,7 +134,7 @@ function handleSSE(req, res) {
   const timer = setInterval(() => {
     try {
       const tasks = DOWNLOAD_MANAGER.getAllTasks();
-      const hb = { type: 'heartbeat', tasks, timestamp: Date.now() / 1000 };
+      const hb = { type: 'heartbeat', tasks, storage_error: DOWNLOAD_MANAGER.storageError, timestamp: Date.now() / 1000 };
       res.write(`data: ${JSON.stringify(hb)}\n\n`);
     } catch (e) {
       clearInterval(timer);
@@ -195,6 +204,7 @@ const server = http.createServer(async (req, res) => {
       const cfg = getStoredConfig();
       const dpath = cfg.download_dir || '';
       cfg.exists = fs.existsSync(dpath);
+      cfg.unsafe_app_dir = unsafeAppDir(dpath);
       try {
         cfg.is_dir = cfg.exists && fs.statSync(dpath).isDirectory();
       } catch (e) {
@@ -203,8 +213,16 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, cfg);
     }
 
+    if (pathname === '/api/inventory') {
+      try {
+        const downloadDir = getStoredConfig().download_dir || '';
+        if (!CATALOG_DATA) CATALOG_DATA = loadCatalogData();
+        return sendJson(res, { ...await countDownloadedPdfs(downloadDir, CATALOG_DATA.books), download_dir: downloadDir });
+      } catch (err) { return sendJson(res, { error: '读取本地 PDF 数量失败：' + err.message }, 500); }
+    }
+
     if (pathname === '/api/tasks') {
-      return sendJson(res, { tasks: DOWNLOAD_MANAGER.getAllTasks() });
+      return sendJson(res, { tasks: DOWNLOAD_MANAGER.getAllTasks(), storage_error: DOWNLOAD_MANAGER.storageError });
     }
 
     if (pathname === '/api/events') {
@@ -235,6 +253,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, { error: '下载目录不能为空' }, 400);
       }
       const resolvedDir = path.resolve(newDir);
+      if (unsafeAppDir(resolvedDir)) return sendJson(res, { error: '请选择应用安装包以外的教材目录，例如文稿文件夹。' }, 400);
 
       // 1. 如果路径指向 macOS 外接磁盘 (/Volumes/xxx)，先检查该磁盘是否挂载
       if (resolvedDir.startsWith('/Volumes/')) {
@@ -253,7 +272,11 @@ const server = http.createServer(async (req, res) => {
         if (!fs.existsSync(resolvedDir)) {
           fs.mkdirSync(resolvedDir, { recursive: true });
         }
+        if (!fs.statSync(resolvedDir).isDirectory()) {
+          return sendJson(res, { error: '请选择文件夹，不能选择文件' }, 400);
+        }
         fs.accessSync(resolvedDir, fs.constants.R_OK | fs.constants.W_OK);
+        saveStoredConfig({ download_dir: resolvedDir });
       } catch (e) {
         if (e.code === 'EACCES' || e.code === 'EPERM') {
           return sendJson(res, {
@@ -263,7 +286,6 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, { error: `无法创建或访问该目录: ${e.message}` }, 400);
       }
 
-      saveStoredConfig({ download_dir: resolvedDir });
       return sendJson(res, { success: true, download_dir: resolvedDir });
     }
 
@@ -296,7 +318,7 @@ const server = http.createServer(async (req, res) => {
         };
         const newCatalog = await refreshCatalogFromPlatform(onProgress);
         CATALOG_DATA = newCatalog;
-        const doneMsg = `共计获取最新教材信息 ${newCatalog.stats.total.toLocaleString()} 本（当前在用教材 ${newCatalog.stats.downloadable_pdf.toLocaleString()} 本）`;
+        const doneMsg = `新增 ${newCatalog.sync.changes.added} 本，信息变更 ${newCatalog.sync.changes.changed} 本，本次未出现 ${newCatalog.sync.changes.missing} 本。共计获取教材信息 ${newCatalog.stats.total.toLocaleString()} 本（当前在用教材 ${newCatalog.stats.downloadable_pdf.toLocaleString()} 本）`;
         const donePayload = {
           type: 'done',
           total: newCatalog.stats.total,
@@ -324,8 +346,8 @@ const server = http.createServer(async (req, res) => {
         CATALOG_DATA = loadCatalogData();
       }
       try {
-        const result = DOWNLOAD_MANAGER.reconcileAndArchive(targetRoot, CATALOG_DATA.books);
-        return sendJson(res, result);
+        const result = await DOWNLOAD_MANAGER.reconcileAndArchive(targetRoot, CATALOG_DATA.books);
+        return sendTaskResult(res, result);
       } catch (err) {
         return sendJson(res, { error: `核对归档异常: ${err.message}` }, 500);
       }
@@ -338,6 +360,9 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, { error: '请先设置并确认有效的下载根目录！' }, 400);
       }
 
+      if (unsafeAppDir(targetRoot)) return sendJson(res, { error: '当前下载目录位于应用安装包内，请重新选择保存目录。' }, 400);
+      if (!fs.statSync(targetRoot).isDirectory()) return sendJson(res, { error: '下载路径不是文件夹' }, 400);
+
       const bookIds = new Set(payload.book_ids || []);
       if (bookIds.size === 0) {
         return sendJson(res, { error: '未指定要下载的书籍 ID' }, 400);
@@ -347,9 +372,13 @@ const server = http.createServer(async (req, res) => {
         CATALOG_DATA = loadCatalogData();
       }
 
-      const matchedBooks = CATALOG_DATA.books.filter(b => bookIds.has(b.id) && b.has_pdf);
-      const addedCount = DOWNLOAD_MANAGER.addTasks(matchedBooks, targetRoot);
-      return sendJson(res, { success: true, added_count: addedCount });
+      const matchedBooks = CATALOG_DATA.books.filter(b => bookIds.has(b.id) && b.has_pdf && b.is_active);
+      const mode = payload.download_mode || 'original';
+      if (mode !== 'original') return sendJson(res, { error: '仅支持官网原始 PDF 下载' }, 400);
+      try {
+        const addedCount = await DOWNLOAD_MANAGER.addTasks(matchedBooks, targetRoot);
+        return sendTaskResult(res, { added_count: addedCount });
+      } catch (error) { return sendJson(res, { success: false, error: error.message }, 409); }
     }
 
     if (pathname === '/api/tasks/active') {
@@ -358,56 +387,55 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/tasks/pause') {
       const paused = payload.id ? DOWNLOAD_MANAGER.pauseTask(payload.id) : DOWNLOAD_MANAGER.pauseAll();
-      return sendJson(res, { success: true, count: paused });
+      return sendTaskResult(res, { count: paused }, Boolean(payload.id));
     }
 
     if (pathname === '/api/tasks/resume') {
       const resumed = payload.id ? DOWNLOAD_MANAGER.resumeTask(payload.id) : DOWNLOAD_MANAGER.resumeAll();
-      return sendJson(res, { success: true, count: resumed });
+      return sendTaskResult(res, { count: resumed }, Boolean(payload.id));
     }
 
     if (pathname === '/api/tasks/retry') {
       const retried = DOWNLOAD_MANAGER.retryFailedTasks(payload.task_ids || null);
-      return sendJson(res, { success: true, count: retried });
+      return sendTaskResult(res, { count: retried }, Boolean(payload.task_ids?.length));
     }
 
     if (pathname === '/api/tasks/delete') {
-      if (payload.id) {
-        DOWNLOAD_MANAGER.deleteTask(payload.id);
-      } else if (payload.task_ids && Array.isArray(payload.task_ids)) {
-        DOWNLOAD_MANAGER.deleteBatchTasks(payload.task_ids);
-      }
-      return sendJson(res, { success: true });
+      const count = payload.id ? Number(DOWNLOAD_MANAGER.deleteTask(payload.id)) :
+        Array.isArray(payload.task_ids) ? DOWNLOAD_MANAGER.deleteBatchTasks(payload.task_ids) : 0;
+      return sendTaskResult(res, { count }, true);
     }
 
     if (pathname === '/api/tasks/clear_downloading') {
       const count = DOWNLOAD_MANAGER.clearDownloadingTasks();
-      return sendJson(res, { success: true, count });
+      return sendTaskResult(res, { count });
     }
 
     if (pathname === '/api/tasks/clear_failed') {
       const count = DOWNLOAD_MANAGER.clearFailedTasks(payload.task_ids || null);
-      return sendJson(res, { success: true, count });
+      return sendTaskResult(res, { count });
     }
 
     if (pathname === '/api/tasks/clear_completed') {
       const count = DOWNLOAD_MANAGER.clearCompletedTasks();
-      return sendJson(res, { success: true, count });
+      return sendTaskResult(res, { count });
     }
 
     if (pathname === '/api/tasks/open_folder') {
-      const ok = DOWNLOAD_MANAGER.openItemInFolder(payload.id);
-      return sendJson(res, { success: ok });
+      try {
+        const ok = await DOWNLOAD_MANAGER.openItemInFolder(payload.id);
+        return sendJson(res, { success: ok });
+      } catch (error) { return sendJson(res, { success: false, error: error.message }, 400); }
     }
 
     if (pathname === '/api/tasks/clear') {
-      DOWNLOAD_MANAGER.clearCompletedTasks();
-      return sendJson(res, { success: true });
+      const count = DOWNLOAD_MANAGER.clearCompletedTasks();
+      return sendTaskResult(res, { count });
     }
 
     if (pathname === '/api/tasks/cancel') {
-      DOWNLOAD_MANAGER.pauseAll();
-      return sendJson(res, { success: true });
+      const count = DOWNLOAD_MANAGER.pauseAll();
+      return sendTaskResult(res, { count });
     }
 
     return sendJson(res, { error: 'Not Found' }, 404);
@@ -425,7 +453,7 @@ function runServer(port = 8080, callback = null) {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`🚀 ChinaK12BookDownLoader (纯 Node.js 服务) 已就绪: http://127.0.0.1:${port}`);
+    console.log(`🚀 K12 Books (纯 Node.js 服务) 已就绪: http://127.0.0.1:${port}`);
     if (callback) callback(port);
   });
   return server;
@@ -434,6 +462,14 @@ function runServer(port = 8080, callback = null) {
 if (require.main === module) {
   const argPort = process.argv[2] && !isNaN(process.argv[2]) ? parseInt(process.argv[2], 10) : 8080;
   runServer(argPort);
+  const shutdown = () => {
+    DOWNLOAD_MANAGER.pauseAll();
+    DOWNLOAD_MANAGER.saveToStorage(true);
+    server.close();
+    process.exit(0);
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 module.exports = {

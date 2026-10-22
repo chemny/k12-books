@@ -13,7 +13,7 @@
 - 若打开仍报错，在终端执行：
 
   ```bash
-  sudo xattr -r -d com.apple.quarantine /Applications/ChinaK12BookDownLoader.app
+  sudo xattr -r -d com.apple.quarantine "/Applications/K12 Books.app"
   ```
 
   回车并输入开机管理员密码。

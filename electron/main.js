@@ -1,6 +1,7 @@
 // Electron 桌面主进程窗口入口
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const path = require("path");
+app.setName("K12 Books");
 const { runServer, server, DOWNLOAD_MANAGER } = require("../server");
 
 // 拦截并静默处理流中断与取消异常，杜绝弹出 Electron 系统报错弹窗
@@ -41,7 +42,7 @@ function createWindow(port = 8080) {
     height: 900,
     minWidth: 1024,
     minHeight: 700,
-    title: "ChinaK12BookDownLoader - 国家智慧教育平台教材下载器",
+    title: "K12 Books",
     icon: path.join(__dirname, "../build/icon.png"),
     backgroundColor: "#0c0d12",
     webPreferences: {
@@ -73,7 +74,7 @@ function createWindow(port = 8080) {
         // 用户确认退出：暂停所有下载、清理并保存状态
         isForceQuitting = true;
         DOWNLOAD_MANAGER.pauseAll();
-        DOWNLOAD_MANAGER.saveToStorage();
+        DOWNLOAD_MANAGER.saveToStorage(true);
         if (server) {
           try { server.close(); } catch (err) {}
         }
@@ -105,7 +106,7 @@ app.whenReady().then(() => {
 app.on("before-quit", () => {
   if (DOWNLOAD_MANAGER) {
     DOWNLOAD_MANAGER.pauseAll();
-    DOWNLOAD_MANAGER.saveToStorage();
+    DOWNLOAD_MANAGER.saveToStorage(true);
   }
   if (server) {
     try { server.close(); } catch (e) {}

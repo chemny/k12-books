@@ -3,8 +3,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const https = require('https');
-const { exec } = require('child_process');
+const { inspectPdf, walkPdfs, readReceipt } = require('./pdfFiles');
+const { execFile } = require('child_process');
 const { customDnsLookup } = require('./dnsResolver');
+const { fetchCourseChild } = require('./courseResources');
 
 function archiveSingleFileToHistory(sourceFile, rootPath) {
   const relPath = path.relative(rootPath, sourceFile);
@@ -13,22 +15,27 @@ function archiveSingleFileToHistory(sourceFile, rootPath) {
 
   fs.mkdirSync(historyDir, { recursive: true });
 
-  if (fs.existsSync(historyTarget)) {
-    fs.unlinkSync(historyTarget);
+  // 重复归档保留每一份历史文件，不覆盖先前归档。
+  let destination = historyTarget;
+  let suffix = 1;
+  while (fs.existsSync(destination) || fs.existsSync(destination + '.download.json')) {
+    destination = historyTarget.replace(/\.pdf$/i, ` (${suffix++}).pdf`);
   }
-
-  try {
-    fs.renameSync(sourceFile, historyTarget);
-  } catch (err) {
-    if (err.code === 'EXDEV') {
-      fs.copyFileSync(sourceFile, historyTarget);
-      fs.unlinkSync(sourceFile);
-    } else {
-      throw err;
+  const move = (source, target) => {
+    try { fs.renameSync(source, target); }
+    catch (err) {
+      if (err.code !== 'EXDEV') throw err;
+      fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+      fs.unlinkSync(source);
     }
+  };
+  move(sourceFile, destination);
+  if (fs.existsSync(sourceFile + '.download.json')) {
+    try { move(sourceFile + '.download.json', destination + '.download.json'); }
+    catch (err) { move(destination, sourceFile); throw err; }
   }
 
-  return historyTarget;
+  return destination;
 }
 
 const GLOBAL_HEADERS = {
@@ -57,249 +64,51 @@ function pickBestPdfItem(items) {
   return candidates[0];
 }
 
-function requestJson(urlStr, options = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const signal = options.signal;
-    if (signal && signal.aborted) {
-      return reject(new Error('AbortError'));
-    }
+const { streamDownloadToFile: transfer, withRetry } = require('./transfer');
+const { DATA_DIR, atomicWrite, logDownload } = require('./storage');
+const { fallbackRoutes } = require('./cdnTransport');
 
-    const req = https.request({
-      hostname: u.hostname,
-      port: u.port || 443,
-      path: u.pathname + u.search,
-      method: 'GET',
-      headers: {
-        ...GLOBAL_HEADERS,
-        'Accept': 'application/json, text/plain, */*',
-        ...(options.headers || {})
-      },
-      lookup: customDnsLookup,
-      timeout: options.timeout || 12000,
-    }, (res) => {
-      let raw = '';
-      res.setEncoding('utf8');
-      res.on('data', c => raw += c);
+async function requestJson(urlStr, options = {}) {
+  return withRetry(() => new Promise((resolve, reject) => {
+    const req = https.get(urlStr, {
+      signal: options.signal, lookup: customDnsLookup,
+      headers: { ...GLOBAL_HEADERS, Accept: 'application/json' },
+    }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('error', reject);
       res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try {
-            resolve(JSON.parse(raw));
-          } catch (e) {
-            reject(new Error(`Invalid JSON: ${e.message}`));
-          }
-        } else {
-          reject(new Error(`HTTP ${res.statusCode}`));
+        if (res.statusCode !== 200) {
+          const err = Object.assign(new Error(`HTTP ${res.statusCode}`), { code: `HTTP_${res.statusCode}` });
+          const value = res.headers['retry-after'];
+          if (value) err.retryAfterMs = /^\d+$/.test(value) ? Number(value) * 1000 : Math.max(0, Date.parse(value) - Date.now());
+          return reject(err);
         }
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch (err) { reject(err); }
       });
     });
-
-    if (signal) {
-      signal.addEventListener('abort', () => {
-        req.destroy();
-        reject(new Error('AbortError'));
-      }, { once: true });
-    }
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Request timeout'));
-    });
+    req.setTimeout(options.timeout || 15000, () => req.destroy(Object.assign(new Error('元数据请求超时'), { code: 'ETIMEDOUT' })));
     req.on('error', reject);
-    req.end();
-  });
+  }), options);
 }
 
-function streamDownloadToFile({
-  urlStr,
-  tempPartPath,
-  existingBytes,
-  signal,
-  onProgress,
-  connectTimeoutMs = 12000,
-  idleTimeoutMs = 30000,
-}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    if (signal && signal.aborted) {
-      return reject(new Error('AbortError'));
-    }
-
-    const headers = {
-      ...GLOBAL_HEADERS,
-      'Host': u.hostname,
-    };
-
-    let isResume = false;
-    if (existingBytes > 4) {
-      headers['Range'] = `bytes=${existingBytes}-`;
-      isResume = true;
-    }
-
-    let fileWriteStream = null;
-    let timer = null;
-    let isCleanedUp = false;
-    let responseRef = null;
-
-    const resetIdleTimer = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Stream idle timeout'));
-      }, idleTimeoutMs);
-    };
-
-    const cleanup = () => {
-      if (isCleanedUp) return;
-      isCleanedUp = true;
-      if (timer) { clearTimeout(timer); timer = null; }
-
-      if (responseRef) {
-        try {
-          responseRef.removeAllListeners('data');
-          responseRef.removeAllListeners('end');
-          responseRef.removeAllListeners('error');
-          responseRef.destroy();
-        } catch (e) {}
-      }
-
-      try { req.destroy(); } catch (e) {}
-
-      if (fileWriteStream) {
-        try {
-          if (!fileWriteStream.destroyed) {
-            fileWriteStream.destroy();
-          }
-        } catch (e) {}
-      }
-    };
-
-    const req = https.request({
-      hostname: u.hostname,
-      port: u.port || 443,
-      path: u.pathname + u.search,
-      method: 'GET',
-      headers,
-      lookup: customDnsLookup,
-      timeout: connectTimeoutMs,
-    }, (res) => {
-      responseRef = res;
-
-      if (isCleanedUp || (signal && signal.aborted)) {
-        cleanup();
-        return reject(new Error('AbortError'));
-      }
-
-      if (res.statusCode === 401 || res.statusCode === 403) {
-        cleanup();
-        return reject(new Error(`官方限制 (HTTP ${res.statusCode})`));
-      }
-      if (res.statusCode !== 200 && res.statusCode !== 206) {
-        cleanup();
-        return reject(new Error(`CDN 节点异常 (HTTP ${res.statusCode})`));
-      }
-
-      let totalBytes = 0;
-      const contentLen = res.headers['content-length'];
-      if (contentLen) {
-        const len = parseInt(contentLen, 10);
-        totalBytes = (res.statusCode === 206) ? (existingBytes + len) : len;
-      }
-
-      const fileFlags = (res.statusCode === 206) ? 'a' : 'w';
-      let written = (res.statusCode === 206) ? existingBytes : 0;
-      fileWriteStream = fs.createWriteStream(tempPartPath, { flags: fileFlags });
-
-      // 静默捕获文件流异常，杜绝 ERR_STREAM_DESTROYED 冒泡
-      fileWriteStream.on('error', (err) => {
-        cleanup();
-      });
-
-      let isFirstChunk = (written === 0);
-      let isValidPdf = true;
-
-      resetIdleTimer();
-
-      res.on('data', (chunk) => {
-        resetIdleTimer();
-
-        if (isCleanedUp || (signal && signal.aborted) || !fileWriteStream || fileWriteStream.destroyed || fileWriteStream.closed) {
-          cleanup();
-          return reject(new Error('AbortError'));
-        }
-
-        if (isFirstChunk) {
-          isFirstChunk = false;
-          // 校验 %PDF 魔数 (0x25 0x50 0x44 0x46)
-          if (chunk.length >= 4) {
-            if (chunk[0] !== 0x25 || chunk[1] !== 0x50 || chunk[2] !== 0x44 || chunk[3] !== 0x46) {
-              isValidPdf = false;
-              cleanup();
-              return reject(new Error('Invalid PDF magic header'));
-            }
-          }
-        }
-
-        try {
-          if (!fileWriteStream.destroyed && !fileWriteStream.closed) {
-            fileWriteStream.write(chunk);
-            written += chunk.length;
-            if (onProgress) {
-              onProgress(written, totalBytes);
-            }
-          }
-        } catch (err) {
-          cleanup();
-        }
-      });
-
-      res.on('end', () => {
-        if (timer) clearTimeout(timer);
-        if (isCleanedUp) return;
-        try {
-          fileWriteStream.end(() => {
-            if (!isValidPdf || written < 20 * 1024) {
-              return reject(new Error('File incomplete or invalid'));
-            }
-            resolve({ written, totalBytes });
-          });
-        } catch (e) {
-          cleanup();
-        }
-      });
-
-      res.on('error', (err) => {
-        cleanup();
-        reject(err);
-      });
-    });
-
-    if (signal) {
-      signal.addEventListener('abort', () => {
-        cleanup();
-        reject(new Error('AbortError'));
-      }, { once: true });
-    }
-
-    req.on('timeout', () => {
-      cleanup();
-      reject(new Error('Connection timeout'));
-    });
-
-    req.on('error', (err) => {
-      cleanup();
-      reject(err);
-    });
-
-    req.end();
-  });
+async function isVerifiedFile(task) {
+  try {
+    const receipt = await readReceipt(task.target_full_path);
+    if (!receipt || receipt.id !== task.id || receipt.update_time !== task.update_time) return false;
+    const info = await inspectPdf(task.target_full_path, { signal: task.abortController?.signal });
+    return info.complete && receipt.size === info.size && receipt.sha256 === info.sha256;
+  } catch (error) { if (task.abortController?.signal.aborted) throw error; return false; }
 }
 
-const TASKS_STORAGE_FILE = path.join(os.homedir(), '.chinak12_downloader_tasks.json');
+const TASKS_STORAGE_FILE = path.join(DATA_DIR, 'tasks.json');
 
 class TaskItem {
   constructor(bookMeta, targetRoot) {
     this.id = bookMeta.id;
+    this.resource_id = bookMeta.resource_id || bookMeta.id;
+    this.parent_ids = bookMeta.parent_ids || [];
     this.seq = bookMeta.seq || 0;
     this.title = bookMeta.title || '';
     this.clean_title = bookMeta.clean_title || '';
@@ -332,6 +141,8 @@ class TaskItem {
 
     return {
       id: this.id,
+      resource_id: this.resource_id,
+      parent_ids: this.parent_ids,
       seq: this.seq,
       title: this.title,
       clean_title: this.clean_title,
@@ -360,7 +171,14 @@ class TaskItem {
 }
 
 class DownloadManager {
-  constructor(maxWorkers = 2) {
+  constructor(maxWorkers = 2, dependencies = {}) {
+    this.execFile = dependencies.execFile || execFile;
+    this.storageError = null;
+    this.reconcilingRoots = new Set();
+    this.preparingRoots = new Set();
+    this.requestJson = dependencies.requestJson || requestJson;
+    this.transfer = dependencies.transfer || transfer;
+    this.fallbackRoutes = dependencies.fallbackRoutes || fallbackRoutes;
     // 降低默认并发至 2，避免触发 CDN 频率限制与 403 拒绝
     this.maxWorkers = maxWorkers;
     this.tasks = new Map();
@@ -391,14 +209,16 @@ class DownloadManager {
   }
 
   // --- 持久化存储与恢复 ---
-  saveToStorage() {
+  saveToStorage(immediate = true) {
     if (this._saveTimer) clearTimeout(this._saveTimer);
-    this._saveTimer = setTimeout(() => {
+    const save = () => {
       try {
         const serialized = this.taskOrder.map(tid => {
           const t = this.tasks.get(tid);
           return {
             id: t.id,
+            resource_id: t.resource_id,
+            parent_ids: t.parent_ids,
             seq: t.seq,
             title: t.title,
             clean_title: t.clean_title,
@@ -413,24 +233,35 @@ class DownloadManager {
             error_msg: t.error_msg,
           };
         });
-        fs.writeFileSync(TASKS_STORAGE_FILE, JSON.stringify(serialized, null, 2), 'utf-8');
+        atomicWrite(TASKS_STORAGE_FILE, serialized);
+        const recovered = this.storageError !== null;
+        this.storageError = null;
+        if (recovered) this.notify('storage_status', { error: null });
+        return true;
       } catch (e) {
+        this.storageError = `任务记录保存失败（${e.code || '写入错误'}），当前状态尚未保存，重启后可能丢失。`;
+        this.notify('storage_status', { error: this.storageError });
         console.warn('⚠️ 保存下载任务到磁盘失败:', e.message);
+        return false;
       }
-    }, 500);
+    };
+    if (immediate) return save();
+    else this._saveTimer = setTimeout(save, 500);
   }
 
   loadFromStorage() {
-    if (!fs.existsSync(TASKS_STORAGE_FILE)) return;
+    const storedFile = fs.existsSync(TASKS_STORAGE_FILE) ? TASKS_STORAGE_FILE :
+      process.env.CHINAK12_DATA_DIR ? null : path.join(os.homedir(), '.chinak12_downloader_tasks.json');
+    if (!storedFile || !fs.existsSync(storedFile)) return;
     try {
-      const data = JSON.parse(fs.readFileSync(TASKS_STORAGE_FILE, 'utf-8'));
+      const data = JSON.parse(fs.readFileSync(storedFile, 'utf-8'));
       if (Array.isArray(data)) {
         for (const item of data) {
-          if (!item.id) continue;
+          if (!item.id || item.download_mode === 'public_preview' || item.id.endsWith(':preview')) continue;
           const task = new TaskItem(item, item.target_root);
           task.total_bytes = item.total_bytes || 0;
           task.downloaded_bytes = item.downloaded_bytes || 0;
-          task.status = item.status === 'downloading' ? 'paused' : item.status;
+          task.status = ['downloading', 'pending'].includes(item.status) ? 'paused' : item.status;
           task.error_msg = item.error_msg || '';
 
           this.tasks.set(task.id, task);
@@ -452,73 +283,41 @@ class DownloadManager {
     return false;
   }
 
-  addTasks(bookItems, targetRoot) {
-    let added = 0;
-    for (const item of bookItems) {
-      const bookId = item.id;
-      if (this.tasks.has(bookId)) {
-        const t = this.tasks.get(bookId);
-        if (['failed', 'paused'].includes(t.status)) {
-          t.status = 'pending';
-          t.error_msg = '';
-          t.target_root = targetRoot;
-          t.target_full_path = path.join(targetRoot, t.relative_path);
-          added++;
+  async addTasks(bookItems, targetRoot) {
+    const root = path.resolve(targetRoot);
+    if (this.reconcilingRoots.has(root) || this.preparingRoots.has(root)) throw new Error('当前目录正在核对，请完成后再下载');
+    this.preparingRoots.add(root);
+    try {
+      const prepared = [];
+      for (const item of bookItems) {
+        const task = new TaskItem(item, targetRoot);
+        const old = this.tasks.get(task.id);
+        if (old && (['downloading', 'pending'].includes(old.status) || old.abortController)) continue;
+        const relative = path.relative(root, path.resolve(task.target_full_path));
+        if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('教材路径超出下载目录');
+        if (await isVerifiedFile(task)) {
+          task.status = 'skipped';
+          task.downloaded_bytes = (await fs.promises.stat(task.target_full_path)).size;
+          task.total_bytes = task.downloaded_bytes;
         }
-        continue;
+        prepared.push(task);
       }
-
-      const task = new TaskItem(item, targetRoot);
-      const targetPath = task.target_full_path;
-      const targetDir = path.dirname(targetPath);
-
-      // 快速核对：如果本地已有该书（或旧前缀命名文件），立即置为 skipped，绝不排入 pending 队列！
-      let alreadyOnDisk = false;
-      let matchedSize = 0;
-      if (fs.existsSync(targetPath)) {
-        const s = fs.statSync(targetPath).size;
-        if (task.total_bytes > 0 && Math.abs(s - task.total_bytes) <= (task.total_bytes * 0.05)) {
-          alreadyOnDisk = true;
-          matchedSize = s;
-        }
-      } else if (fs.existsSync(targetDir)) {
-        try {
-          const files = fs.readdirSync(targetDir);
-          for (const f of files) {
-            if (!f.endsWith('.pdf') || f.startsWith('.')) continue;
-            const fPath = path.join(targetDir, f);
-            const s = fs.statSync(fPath).size;
-            if (task.total_bytes > 0 && Math.abs(s - task.total_bytes) <= (task.total_bytes * 0.05)) {
-              const bCore = task.clean_title ? task.clean_title.replace(/^[（(][^）)]+[）)]/, '').trim() : '';
-              if ((task.edition_tag && f.includes(task.edition_tag)) || (bCore && f.includes(bCore))) {
-                fs.renameSync(fPath, targetPath);
-                alreadyOnDisk = true;
-                matchedSize = s;
-                break;
-              }
-            }
-          }
-        } catch (e) {}
+      let added = 0;
+      const replaced = new Set();
+      for (const task of prepared) {
+        const old = this.tasks.get(task.id);
+        if (old && (['downloading', 'pending'].includes(old.status) || old.abortController)) continue;
+        replaced.add(task.id);
+        this.tasks.set(task.id, task);
+        if (task.status === 'pending') added++;
       }
-
-      if (alreadyOnDisk) {
-        task.status = 'skipped';
-        task.downloaded_bytes = matchedSize;
-        task.total_bytes = matchedSize;
-        task.finish_time = Date.now();
-      } else {
-        task.status = 'pending';
-        added++;
-      }
-
-      this.tasks.set(bookId, task);
-      this.taskOrder.push(bookId);
-    }
-
-    this.saveToStorage();
-    this.notify('tasks_updated', { added_count: added });
-    this.triggerWorkers();
-    return added;
+      this.taskOrder = this.taskOrder.filter(id => !replaced.has(id));
+      this.taskOrder.push(...replaced);
+      this.saveToStorage();
+      this.notify('tasks_updated', { added_count: added });
+      this.triggerWorkers();
+      return added;
+    } finally { this.preparingRoots.delete(root); }
   }
 
   hasPendingTasks() {
@@ -575,12 +374,17 @@ class DownloadManager {
         try {
           await this.downloadTask(task);
         } catch (err) {
-          if (task.status !== 'paused') {
+          if (!['paused', 'cancelled'].includes(task.status)) {
             task.status = 'failed';
-            task.error_msg = err.message || String(err);
+            task.error_msg = `${err.code || err.name}: ${err.message || String(err)}`;
+            logDownload({ event: 'task_failed', id: task.id, error: task.error_msg });
           }
         } finally {
           task.abortController = null;
+          if (task.resumeRequested && this.tasks.get(task.id) === task) {
+            task.resumeRequested = false;
+            task.status = 'pending';
+          }
           this.saveToStorage();
           this.notify('task_finished', task.toDict());
           // 上下任务之间礼貌休眠防护：800ms~1200ms 动态随机抖动，彻底规避 CDN 机械化频控与封锁
@@ -602,73 +406,57 @@ class DownloadManager {
     const targetRootPath = path.resolve(task.target_root);
     const targetPath = path.resolve(task.target_full_path);
     const targetDir = path.dirname(targetPath);
+    const relative = path.relative(targetRootPath, targetPath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('教材路径超出下载目录');
     fs.mkdirSync(targetDir, { recursive: true });
-
-    // 1. 检查本地已存在正版文件
-    if (fs.existsSync(targetPath)) {
-      const stats = fs.statSync(targetPath);
-      const localSize = stats.size;
-      const expectedSize = task.total_bytes;
-
-      if (expectedSize > 0 && Math.abs(localSize - expectedSize) <= (expectedSize * 0.05)) {
-        task.status = 'skipped';
-        task.downloaded_bytes = localSize;
-        return;
-      } else {
-        console.warn(`⚠️ 本地文件大小(${localSize})与预期(${expectedSize})不匹配，判定为未完成残缺文件，准备重新下载`);
-      }
-    } else if (fs.existsSync(targetDir)) {
-      // 检查目录内是否存在带历史前缀命名的同款文件
-      try {
-        const files = fs.readdirSync(targetDir);
-        for (const f of files) {
-          if (!f.endsWith('.pdf') || f.startsWith('.')) continue;
-          const fPath = path.join(targetDir, f);
-          const s = fs.statSync(fPath).size;
-          if (task.total_bytes > 0 && Math.abs(s - task.total_bytes) <= (task.total_bytes * 0.05)) {
-            const bCore = task.clean_title ? task.clean_title.replace(/^[（(][^）)]+[）)]/, '').trim() : '';
-            if ((task.edition_tag && f.includes(task.edition_tag)) || (bCore && f.includes(bCore))) {
-              fs.renameSync(fPath, targetPath);
-              task.status = 'skipped';
-              task.downloaded_bytes = s;
-              task.total_bytes = s;
-              return;
-            }
-          }
-        }
-      } catch (e) {}
+    if (await isVerifiedFile(task)) {
+      task.status = 'skipped';
+      task.downloaded_bytes = fs.statSync(targetPath).size;
+      return;
     }
 
     // 2. 临时下载目录
     const tempDir = path.join(targetRootPath, '.download_temp');
     fs.mkdirSync(tempDir, { recursive: true });
-    const tempPart = path.join(tempDir, `${task.id}.pdf.part`);
-    const tempFinished = path.join(tempDir, `${task.id}.pdf`);
+    const tempPart = path.join(tempDir, `${String(task.id).replace(/[^a-zA-Z0-9_-]/g, '_')}-${require('crypto').createHash('sha256').update(task.update_time || '').digest('hex').slice(0, 12)}.pdf.part`);
+    const tempFinished = tempPart + '.complete';
 
     // 3. 获取下载链接 (包含重试与备用接口)
     let detailsData = null;
     const detailsUrls = [
-      `https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${task.id}.json`,
-      `https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${task.id}.json`,
-      `https://s-file-3.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${task.id}.json`,
+      `https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${encodeURIComponent(task.resource_id)}.json`,
+      `https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${encodeURIComponent(task.resource_id)}.json`,
+      `https://s-file-3.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/${encodeURIComponent(task.resource_id)}.json`,
     ];
 
+    let metadataError = '';
     for (const dUrl of detailsUrls) {
-      if (task.status === 'paused') return;
+      if (task.status !== 'downloading') return;
       try {
-        detailsData = await requestJson(dUrl, {
+        detailsData = await this.requestJson(dUrl, {
           signal: task.abortController ? task.abortController.signal : null,
           timeout: 10000,
         });
         if (detailsData) break;
       } catch (e) {
-        if (e.message === 'AbortError') return;
+        if (task.abortController?.signal.aborted) return;
+        metadataError = `${e.code || e.name}: ${e.message}`;
+        logDownload({ event: 'metadata_failed', id: task.id, host: new URL(dUrl).hostname, error: metadataError });
       }
     }
 
+    if (!detailsData && task.parent_ids.length) {
+      try {
+        detailsData = await fetchCourseChild(task.resource_id, task.parent_ids,
+          url => this.requestJson(url, { signal: task.abortController?.signal, timeout: 10000 }));
+      } catch (err) {
+        if (task.abortController?.signal.aborted) return;
+        metadataError = err.message;
+      }
+    }
     if (!detailsData) {
       task.status = 'failed';
-      task.error_msg = '官方元数据解析超时或拒绝 (请点击重试)';
+      task.error_msg = `教材详情获取失败：${metadataError}`;
       return;
     }
 
@@ -693,7 +481,8 @@ class DownloadManager {
         storage
       ];
       for (const cand of candidates) {
-        const encoded = encodeURI(cand);
+        let encoded;
+        try { const u = new URL(cand); if (u.protocol !== 'https:') continue; encoded = u.href; } catch { continue; }
         if (!candidateUrls.includes(encoded)) {
           candidateUrls.push(encoded);
         }
@@ -706,27 +495,23 @@ class DownloadManager {
       return;
     }
 
-    // 4. 断点续传准备
-    let existingBytes = 0;
-    if (fs.existsSync(tempPart)) {
-      try {
-        existingBytes = fs.statSync(tempPart).size;
-      } catch (e) {}
-    }
-
     let downloadOk = false;
     let lastErrorReason = '';
-    for (const url of candidateUrls) {
+    const routes = candidateUrls.map(url => ({ url, name: 'direct' }));
+    for (let routeIndex = 0; routeIndex < routes.length; routeIndex++) {
+      const { url, transport, name: routeName } = routes[routeIndex];
       if (task.status !== 'downloading') return;
 
       try {
         let lastSpeedTime = Date.now();
-        let lastSpeedBytes = existingBytes;
+        let lastSpeedBytes = 0;
 
-        const res = await streamDownloadToFile({
+        const res = await withRetry(() => this.transfer({
           urlStr: url,
+          transport,
           tempPartPath: tempPart,
-          existingBytes: existingBytes,
+          headers: GLOBAL_HEADERS,
+          lookup: customDnsLookup,
           signal: task.abortController ? task.abortController.signal : null,
           onProgress: (downloaded, total) => {
             task.downloaded_bytes = downloaded;
@@ -739,30 +524,32 @@ class DownloadManager {
               lastSpeedBytes = downloaded;
             }
           }
+        }), {
+          signal: task.abortController?.signal,
+          onRetry: (err, attempt, wait) => logDownload({ event: 'retry', id: task.id,
+            host: new URL(url).hostname, code: err.code, attempt, wait_ms: wait }),
         });
+        if (task.abortController?.signal.aborted || task.status !== 'downloading') return;
 
-        // 下载完成，原子归档到目标位置
-        if (fs.existsSync(tempFinished)) fs.unlinkSync(tempFinished);
-        fs.renameSync(tempPart, tempFinished);
-
-        try {
-          if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
-          fs.renameSync(tempFinished, targetPath);
-        } catch (err) {
-          if (err.code === 'EXDEV') {
-            fs.copyFileSync(tempFinished, targetPath);
-            fs.unlinkSync(tempFinished);
-          } else {
-            throw err;
-          }
+        const info = await inspectPdf(tempPart, { signal: task.abortController?.signal });
+        if (!info.complete) throw Object.assign(new Error('下载文件不是完整 PDF'), { code: 'INVALID_PDF' });
+        if (pdfItem.ti_size > 0 && info.size !== Number(pdfItem.ti_size)) {
+          fs.rmSync(tempPart + '.json', { force: true });
+          throw Object.assign(new Error('文件长度与官网原始 PDF 记录不一致'), { code: 'INTEGRITY_MISMATCH' });
         }
-
-        task.status = 'completed';
-        task.speed = 0;
-        task.error_msg = '';
-        task.downloaded_bytes = res.written;
-        task.total_bytes = res.written;
-        task.finish_time = Date.now();
+        const md5 = info.md5;
+        if (/^[a-f0-9]{32}$/i.test(pdfItem.ti_md5 || '') && md5 !== pdfItem.ti_md5.toLowerCase()) {
+          fs.rmSync(tempPart + '.json', { force: true });
+          throw Object.assign(new Error('文件摘要与官网原始 PDF 不一致，未保存为教材'), { code: 'INTEGRITY_MISMATCH' });
+        }
+        res.official_md5 = pdfItem.ti_md5 || null;
+        res.md5 = md5;
+        res.sha256 = info.sha256;
+        res.route = routeName;
+        if (task.abortController?.signal.aborted || task.status !== 'downloading') return;
+        fs.renameSync(tempPart, tempFinished);
+        await this.completeDownload(task, tempFinished, res);
+        fs.rmSync(tempPart + '.json', { force: true });
         downloadOk = true;
         console.log(`✅ [下载完成] 《${task.filename}》 (${Math.round(res.written / 1024 / 1024 * 10) / 10} MB)`);
         break;
@@ -770,11 +557,17 @@ class DownloadManager {
         if (task.status === 'paused' || (task.abortController && task.abortController.signal.aborted)) {
           return;
         }
-        lastErrorReason = err.message || String(err);
+        lastErrorReason = `${err.code || err.name}: ${err.message || String(err)}`;
+        logDownload({ event: 'download_failed', id: task.id, host: new URL(url).hostname, route: routeName, error: lastErrorReason });
+        if (!transport && (/^HTTP_(401|403)$/.test(err.code || '') || ['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND'].includes(err.code))) {
+          const fallbacks = this.fallbackRoutes(url).map(route => ({ ...route, url }));
+          routes.splice(routeIndex + 1, 0, ...fallbacks);
+        }
+        if (['ENOSPC', 'EACCES', 'EPERM', 'EROFS', 'EIO'].includes(err.code)) throw err;
         if (lastErrorReason.includes('Invalid PDF magic header')) {
           try { if (fs.existsSync(tempPart)) fs.unlinkSync(tempPart); } catch (e) {}
-          existingBytes = 0;
         }
+        if (err.code === 'INVALID_PDF') fs.rmSync(tempPart + '.json', { force: true });
         console.warn(`⚠️ [镜像重试] 《${task.filename}》: ${lastErrorReason}`);
         await new Promise(r => setTimeout(r, 200));
         continue;
@@ -783,8 +576,30 @@ class DownloadManager {
 
     if (!downloadOk && task.status === 'downloading') {
       task.status = 'failed';
-      task.error_msg = lastErrorReason || '所有 CDN 节点连接超时或拒绝 (请稍后重试)';
+      task.error_msg = /HTTP_40[13]/.test(lastErrorReason)
+        ? `原始 PDF 节点拒绝本次访问（401/403），当前连接方式及备用节点均未成功；未替换为预览图片。详情：${lastErrorReason}`
+        : lastErrorReason || '所有 CDN 节点连接失败，请查看下载日志';
     }
+  }
+
+  async completeDownload(task, tempFile, result) {
+    const target = task.target_full_path;
+    if (fs.existsSync(target)) fs.renameSync(target, `${target}.previous-${Date.now()}.pdf`);
+    try { fs.renameSync(tempFile, target); }
+    catch (err) {
+      if (err.code !== 'EXDEV') throw err;
+      fs.copyFileSync(tempFile, target, fs.constants.COPYFILE_EXCL);
+      fs.unlinkSync(tempFile);
+    }
+    const sha256 = result.sha256 || (await inspectPdf(target)).sha256;
+    atomicWrite(target + '.download.json', { id: task.id, resource_id: task.resource_id,
+      update_time: task.update_time, size: result.written, sha256,
+      official_md5: result.official_md5 || null, md5: result.md5 || null, route: result.route || 'direct',
+      downloaded_at: new Date().toISOString() });
+    task.status = 'completed'; task.speed = 0; task.error_msg = '';
+    task.downloaded_bytes = result.written; task.total_bytes = result.written; task.finish_time = Date.now();
+    logDownload({ event: 'completed', id: task.id, size: result.written,
+      route: result.route || 'direct', official_md5: result.official_md5 || null });
   }
 
   // --- 暂停、恢复与重试控制 ---
@@ -792,12 +607,13 @@ class DownloadManager {
   pauseTask(taskId) {
     const t = this.tasks.get(taskId);
     if (!t) return false;
+    if (t.status === 'paused') t.resumeRequested = false;
     if (t.status === 'downloading' || t.status === 'pending') {
       t.status = 'paused';
+      t.resumeRequested = false;
       t.speed = 0;
       if (t.abortController) {
         t.abortController.abort();
-        t.abortController = null;
       }
       this.saveToStorage();
       this.notify('task_updated', t.toDict());
@@ -809,12 +625,13 @@ class DownloadManager {
   pauseAll() {
     let count = 0;
     for (const t of this.tasks.values()) {
+      t.resumeRequested = false;
       if (t.status === 'downloading' || t.status === 'pending') {
         t.status = 'paused';
+        t.resumeRequested = false;
         t.speed = 0;
         if (t.abortController) {
           t.abortController.abort();
-          t.abortController = null;
         }
         count++;
       }
@@ -828,6 +645,7 @@ class DownloadManager {
     const t = this.tasks.get(taskId);
     if (!t) return false;
     if (t.status === 'paused' || t.status === 'failed') {
+      if (t.abortController) { t.resumeRequested = true; return true; }
       t.status = 'pending';
       t.error_msg = '';
       this.saveToStorage();
@@ -842,6 +660,7 @@ class DownloadManager {
     let count = 0;
     for (const t of this.tasks.values()) {
       if (t.status === 'paused') {
+        if (t.abortController) { t.resumeRequested = true; count++; continue; }
         t.status = 'pending';
         t.error_msg = '';
         count++;
@@ -878,15 +697,18 @@ class DownloadManager {
     if (!t) return false;
 
     // 1. 如果正在下载，先中止网络流
+    const priorStatus = t.status;
+    t.resumeRequested = false;
+    t.status = 'cancelled';
     if (t.abortController) {
       t.abortController.abort();
       t.abortController = null;
     }
 
     // 2. 按照用户要求：若未完成（downloading, pending, paused, failed），删除任务的同时删除下载中的文件/临时分块
-    if (['pending', 'downloading', 'paused', 'failed'].includes(t.status)) {
-      const tempPart = path.join(t.target_root, '.download_temp', `${t.id}.pdf.part`);
-      const tempFinished = path.join(t.target_root, '.download_temp', `${t.id}.pdf`);
+    if (['pending', 'downloading', 'paused', 'failed'].includes(priorStatus)) {
+      const tempPart = path.join(t.target_root, '.download_temp', `${String(t.id).replace(/[^a-zA-Z0-9_-]/g, '_')}-${require('crypto').createHash('sha256').update(t.update_time || '').digest('hex').slice(0, 12)}.pdf.part`);
+      const tempFinished = tempPart + '.complete';
       const safeUnlink = (p) => {
         try {
           if (fs.existsSync(p)) fs.unlinkSync(p);
@@ -897,7 +719,10 @@ class DownloadManager {
         }
       };
       safeUnlink(tempPart);
+      safeUnlink(tempPart + '.json');
       safeUnlink(tempFinished);
+      safeUnlink(tempPart + '.assembled.pdf');
+      try { fs.rmSync(tempPart + '.pages', { recursive: true, force: true }); } catch {}
     }
     // 已经下载完整的书籍保留，不删除实际文件
 
@@ -946,7 +771,7 @@ class DownloadManager {
     // 成功页面：清空列表，保留本地已下载完整的书籍
     const toRemove = [];
     for (const t of this.tasks.values()) {
-      if (['completed', 'skipped'].includes(t.status)) {
+      if (['completed', 'skipped', 'archived'].includes(t.status)) {
         toRemove.push(t.id);
       }
     }
@@ -960,38 +785,30 @@ class DownloadManager {
   }
 
   // --- 打开文件与所在目录 (支持 macOS, Windows, Linux) ---
-  openItemInFolder(taskId) {
-    const t = this.tasks.get(taskId);
-    if (!t) return false;
-    const fullPath = t.target_full_path;
-    if (fs.existsSync(fullPath)) {
-      if (process.platform === 'darwin') {
-        exec(`open -R "${fullPath}"`);
-      } else if (process.platform === 'win32') {
-        exec(`explorer.exe /select,"${fullPath.replace(/\//g, '\\')}"`);
-      } else {
-        exec(`xdg-open "${path.dirname(fullPath)}"`);
-      }
-      return true;
+  async openItemInFolder(taskId) {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error('任务不存在，请刷新任务列表');
+    const fullPath = path.resolve(task.target_full_path);
+    const exists = fs.existsSync(fullPath);
+    const directory = path.dirname(fullPath);
+    if (!exists && !fs.existsSync(directory)) throw new Error('文件和所在目录不存在，可能已被移动');
+    let command, args;
+    if (process.platform === 'darwin') {
+      command = 'open'; args = exists ? ['-R', fullPath] : [directory];
+    } else if (process.platform === 'win32') {
+      command = 'explorer.exe'; args = exists ? ['/select,', fullPath] : [directory];
     } else {
-      // 若文件不存在，尝试打开其所在目录
-      const dir = path.dirname(fullPath);
-      if (fs.existsSync(dir)) {
-        if (process.platform === 'darwin') {
-          exec(`open "${dir}"`);
-        } else if (process.platform === 'win32') {
-          exec(`explorer.exe "${dir.replace(/\//g, '\\')}"`);
-        } else {
-          exec(`xdg-open "${dir}"`);
-        }
-        return true;
-      }
+      command = 'xdg-open'; args = [directory];
     }
-    return false;
+    await new Promise((resolve, reject) => this.execFile(command, args, { timeout: 15000 }, error => {
+      if (error) reject(new Error(`打开目录失败（${error.code || '系统错误'}）`));
+      else resolve();
+    }));
+    return true;
   }
 
   // --- 本地教材核对与归档引擎 (严格遵循同目录同名规则与官网下架规则) ---
-  reconcileAndArchive(targetRoot, catalogBooks = null) {
+  async reconcileAndArchive(targetRoot, catalogBooks = null) {
     if (!catalogBooks) {
       const { loadCatalogData } = require('./catalog');
       const cat = loadCatalogData();
@@ -1003,215 +820,98 @@ class DownloadManager {
       return { success: false, error: '指定的下载根目录不存在' };
     }
 
-    const activeBooks = catalogBooks.filter(b => b.is_active && b.has_pdf);
-    const allBooks = catalogBooks;
-
-    // 1. 递归扫描本地磁盘上的所有实际存在的 PDF 文件（排除 History 目录与 .download_temp 目录）
-    const localFiles = [];
-    const scanDir = (dir) => {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const ent of entries) {
-        if (ent.name.startsWith('.')) continue;
-        const full = path.join(dir, ent.name);
-        if (ent.isDirectory()) {
-          if (ent.name !== 'History' && ent.name !== '.download_temp') {
-            scanDir(full);
-          }
-        } else if (ent.isFile() && ent.name.toLowerCase().endsWith('.pdf')) {
-          const stat = fs.statSync(full);
-          localFiles.push({
-            fullPath: full,
-            relPath: path.relative(targetRootPath, full),
-            dir: dir,
-            filename: ent.name,
-            size: stat.size,
-          });
-        }
-      }
-    };
-    scanDir(targetRootPath);
-
-    // 2. 按所在目录对本地文件进行归类（严格落实“同一个目录下的同名”）
-    const filesByDir = new Map();
-    for (const f of localFiles) {
-      if (!filesByDir.has(f.dir)) filesByDir.set(f.dir, []);
-      filesByDir.get(f.dir).push(f);
+    if (!Array.isArray(catalogBooks) || !catalogBooks.length) {
+      throw new Error('目录为空，未执行归档');
     }
+    if (!fs.statSync(targetRootPath).isDirectory()) throw new Error('下载根目录不是文件夹');
+    if ([...this.tasks.values()].some(t => (t.abortController || ['downloading', 'pending'].includes(t.status)) &&
+      path.resolve(t.target_root) === targetRootPath)) throw new Error('请先暂停下载，再核对与归档');
 
+    if (this.reconcilingRoots.has(targetRootPath) || this.preparingRoots.has(targetRootPath)) throw new Error('正在核对与归档，请等待完成');
+    this.reconcilingRoots.add(targetRootPath);
+    try {
+    const activeBooks = catalogBooks.filter(b => b.is_active && b.has_pdf);
+    const byId = new Map(catalogBooks.map(b => [b.id, b]));
+    const byPath = new Map();
+    for (const book of catalogBooks) {
+      const key = path.normalize(book.relative_path);
+      if (!byPath.has(key) || (book.is_active && book.has_pdf)) byPath.set(key, book);
+    }
+    let totalLocalFiles = 0;
     let keptActiveCount = 0;
     let renamedCount = 0;
-    const rule1Archived = []; // 规则 1：同一个目录下的同名教材不是最新，归档
-    const rule2Archived = []; // 规则 2：官网已删除但本地拥有的，归档
-
-    // 辅助匹配函数：针对同一个目录，计算文件与官方在用教材的最佳匹配
-    const matchBestBook = (file, books) => {
-      let best = null;
-      let bestScore = -1;
-      let bestDiff = 999;
-
-      for (const b of books) {
-        let score = 0;
-        // 册次匹配 (上册/下册/全一册)
-        if (b.volume && file.filename.includes(b.volume)) score += 100;
-        else if (!b.volume && (file.filename.includes('全一册') || !file.filename.includes('册'))) score += 50;
-
-        // 修订版本标签匹配 (如 2022修订版)
-        if (b.edition_tag && file.filename.includes(b.edition_tag)) score += 50;
-
-        // 书名核心匹配
-        const bCore = (b.clean_title || b.title).replace(/^[（(][^）)]+[）)]/, '').replace(/^[^\s·]+版[（(][^）)]+[）)]/, '').trim();
-        if (bCore && file.filename.includes(bCore)) score += 80;
-
-        // 大小匹配容差 (5% 以内)
-        const diff = b.pdf_size ? Math.abs(file.size - b.pdf_size) / b.pdf_size : 1;
-        if (diff <= 0.05) score += 50;
-        if (diff <= 0.01) score += 20;
-
-        if (score > bestScore || (score === bestScore && diff < bestDiff)) {
-          bestScore = score;
-          bestDiff = diff;
-          best = b;
+    const rule1Archived = [], rule2Archived = [];
+    const claimed = new Set();
+    const localFiles = [];
+    for await (const fullPath of walkPdfs(targetRootPath)) localFiles.push(fullPath);
+    for (const fullPath of localFiles) {
+      totalLocalFiles++;
+      const file = { fullPath, relPath: path.relative(targetRootPath, fullPath), filename: path.basename(fullPath) };
+      const receipt = await readReceipt(file.fullPath);
+      if (receipt?.invalid) continue;
+      const candidate = byPath.get(file.relPath);
+      // Unknown files need no full-file read; valid provenance can still identify removed resources.
+      if (!receipt?.id && !candidate) continue;
+      let info;
+      try { info = await inspectPdf(file.fullPath); }
+      catch (error) { if (['ENOENT', 'FILE_CHANGED', 'INVALID_PDF'].includes(error.code)) continue; throw error; }
+      const { complete, size } = info;
+      const verified = complete && receipt?.id && receipt.size === size && receipt.sha256 === info.sha256;
+      const book = verified ? byId.get(receipt.id) : candidate;
+      if (!complete) continue;
+      if (!verified && (!book || !book.pdf_size || book.pdf_size !== size)) continue;
+      if (book?.is_active && book.has_pdf && (!verified || receipt.update_time === book.update_time)) {
+        if (claimed.has(book.id)) continue;
+        claimed.add(book.id);
+        keptActiveCount++;
+        const standardPath = path.resolve(targetRootPath, book.relative_path);
+        const relative = path.relative(targetRootPath, standardPath);
+        if (verified && standardPath !== file.fullPath && !relative.startsWith('..') &&
+          !path.isAbsolute(relative) && !fs.existsSync(standardPath) && !fs.existsSync(standardPath + '.download.json')) {
+          fs.mkdirSync(path.dirname(standardPath), { recursive: true });
+          fs.renameSync(file.fullPath, standardPath);
+          try { fs.renameSync(file.fullPath + '.download.json', standardPath + '.download.json'); }
+          catch (err) { fs.renameSync(standardPath, file.fullPath); throw err; }
+          file.fullPath = standardPath; file.relPath = relative; file.filename = path.basename(standardPath);
+          renamedCount++;
         }
+        // 只同步当前保存位置下的任务，保留其他位置的下载记录。
+        const existing = this.tasks.get(book.id);
+        if (!existing || path.resolve(existing.target_root) === targetRootPath) {
+          const task = new TaskItem(book, targetRootPath);
+          task.relative_path = file.relPath;
+          task.filename = file.filename;
+          task.target_full_path = file.fullPath;
+          task.status = 'skipped';
+          task.downloaded_bytes = size; task.total_bytes = size;
+          this.tasks.set(book.id, task);
+          if (!existing) this.taskOrder.push(book.id);
+        }
+        continue;
       }
-      return { book: best, score: bestScore, diff: bestDiff };
-    };
-
-    // 3. 逐个目录执行同目录核对与归档
-    for (const [dir, files] of filesByDir.entries()) {
-      const relDir = path.relative(targetRootPath, dir);
-      const parts = relDir.split(path.sep);
-
-      // 找到属于该目录的官方最新在用教材 (考虑出版社目录命名的轻微别名差异)
-      const dirActiveBooks = activeBooks.filter(b => {
-        const bDir = path.dirname(path.join(targetRootPath, b.relative_path));
-        if (bDir === dir) return true;
-        return parts.length >= 4 && parts[0] === b.stage && parts[1] === b.subject && parts[3] === b.grade &&
-          (b.publisher_dir.includes(parts[2].replace(/-.*$/, '')) || parts[2].includes(b.version));
-      });
-
-      const claimedActiveBookIds = new Set();
-      const unclaimedFiles = [];
-
-      // 优先给与官方标准文件名完全一致的文件匹配
-      files.sort((a, b) => {
-        const aExact = dirActiveBooks.some(bk => bk.filename === a.filename);
-        const bExact = dirActiveBooks.some(bk => bk.filename === b.filename);
-        if (aExact !== bExact) return bExact ? 1 : -1;
-        return 0;
-      });
-
-      for (const file of files) {
-        const availableBooks = dirActiveBooks.filter(b => !claimedActiveBookIds.has(b.id));
-        const res = matchBestBook(file, availableBooks);
-
-        if (res.book && res.diff <= 0.05) {
-          claimedActiveBookIds.add(res.book.id);
-          keptActiveCount++;
-
-          const standardPath = path.join(dir, res.book.filename);
-          if (file.fullPath !== standardPath) {
-            try {
-              if (fs.existsSync(standardPath)) fs.unlinkSync(standardPath);
-              fs.renameSync(file.fullPath, standardPath);
-              file.fullPath = standardPath;
-              file.filename = res.book.filename;
-              renamedCount++;
-            } catch (e) {
-              console.warn(`重命名文件失败: ${e.message}`);
-            }
-          }
-
-          // 在任务管理器中同步或更新状态为 skipped (已存在跳过)
-          let t = this.tasks.get(res.book.id);
-          if (!t) {
-            t = new TaskItem(res.book, targetRootPath);
-            this.tasks.set(res.book.id, t);
-            this.taskOrder.push(res.book.id);
-          }
-          t.status = 'skipped';
-          t.downloaded_bytes = file.size;
-          t.total_bytes = file.size;
-          t.finish_time = Date.now();
-        } else {
-          unclaimedFiles.push(file);
-        }
-      }
-
-      // 处理该目录下剩余未匹配为当前最新官方教材的文件：
-      for (const file of unclaimedFiles) {
-        const dirAllBooks = allBooks.filter(b => {
-          const bDir = path.dirname(path.join(targetRootPath, b.relative_path));
-          if (bDir === dir) return true;
-          return parts.length >= 4 && parts[0] === b.stage && parts[1] === b.subject && parts[3] === b.grade;
-        });
-
-        // 规则 1：同一个目录下的同名教材不是最新，归档
-        // 判定：同目录下已有在用教材匹配同一课程书名，或者在历史书单中存在但属于非最新版(is_active === false)
-        const sameCourseActive = dirActiveBooks.find(b => {
-          const bCore = (b.clean_title || b.title).replace(/^[（(][^）)]+[）)]/, '').replace(/^[^\s·]+版[（(][^）)]+[）)]/, '').trim();
-          return bCore && file.filename.includes(bCore);
-        });
-
-        const matchAll = dirAllBooks.find(b => !b.is_active && (b.filename === file.filename || (b.pdf_size && Math.abs(file.size - b.pdf_size) <= (b.pdf_size * 0.05))));
-
-        if (sameCourseActive || matchAll) {
-          try {
-            const histTarget = archiveSingleFileToHistory(file.fullPath, targetRootPath);
-            rule1Archived.push({
-              filename: file.filename,
-              relPath: file.relPath,
-              dest: path.relative(targetRootPath, histTarget),
-              reason: sameCourseActive ? `同目录下已有最新在用版: ${sameCourseActive.filename}` : '同名教材非最新版 (已由最新版替代)'
-            });
-            if (matchAll && this.tasks.has(matchAll.id)) {
-              this.tasks.get(matchAll.id).status = 'archived';
-            }
-          } catch (e) {
-            console.warn(`⚠️ 规则1归档失败: ${file.relPath} -> ${e.message}`);
-          }
-        } else {
-          // 规则 2：官网已删除但我们有的，归档
-          try {
-            const histTarget = archiveSingleFileToHistory(file.fullPath, targetRootPath);
-            rule2Archived.push({
-              filename: file.filename,
-              relPath: file.relPath,
-              dest: path.relative(targetRootPath, histTarget),
-              reason: '官网当前目录已下架/不存在该资源'
-            });
-          } catch (e) {
-            console.warn(`⚠️ 规则2归档失败: ${file.relPath} -> ${e.message}`);
-          }
-        }
+      // 仅有明确来源的下架文件或已知旧版本才能归档，未知文件保持原位。
+      const outdated = book && (!book.is_active || (verified && receipt.update_time !== book.update_time));
+      const removed = verified && !book;
+      if (!outdated && !removed) continue;
+      const dest = archiveSingleFileToHistory(file.fullPath, targetRootPath);
+      const records = outdated ? rule1Archived : rule2Archived;
+      records.push({ filename: file.filename, relPath: file.relPath,
+        dest: path.relative(targetRootPath, dest),
+        reason: outdated ? '已知教材旧版本' : '已下载资源 ID 不在当前官网目录中' });
+      const task = this.tasks.get(receipt?.id || book?.id);
+      if (task && task.target_full_path === file.fullPath) {
+        task.status = 'archived';
+        task.target_full_path = dest;
+        task.relative_path = path.relative(targetRootPath, dest);
+        task.filename = path.basename(dest);
       }
     }
-
-    // 4. 清理移动后可能留下的空目录
-    try {
-      const cleanEmpty = (d) => {
-        if (!fs.existsSync(d)) return;
-        const items = fs.readdirSync(d);
-        for (const item of items) {
-          if (item === 'History' || item === '.download_temp' || item.startsWith('.')) continue;
-          const sub = path.join(d, item);
-          if (fs.statSync(sub).isDirectory()) {
-            cleanEmpty(sub);
-            try {
-              if (fs.readdirSync(sub).length === 0) {
-                fs.rmdirSync(sub);
-              }
-            } catch (err) {}
-          }
-        }
-      };
-      cleanEmpty(targetRootPath);
-    } catch (e) {}
 
     // 5. 保存状态并广播通知
     this.saveToStorage();
     const result = {
       success: true,
-      total_local_files: localFiles.length,
+      total_local_files: totalLocalFiles,
       active_kept: keptActiveCount,
       renamed_normalized: renamedCount,
       rule1_archived: rule1Archived.length,
@@ -1224,6 +924,7 @@ class DownloadManager {
 
     this.notify('reconcile_completed', result);
     return result;
+    } finally { this.reconcilingRoots.delete(targetRootPath); }
   }
 
   getAllTasks() {
