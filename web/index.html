@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>K12 Books</title>
+  <script src="/theme.js"></script>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -17,6 +18,12 @@
       </div>
     </div>
     <div class="topbar-right">
+      <label class="theme-picker">配色
+        <select id="theme-select" aria-label="界面配色">
+          <option value="light">浅色</option>
+          <option value="dark" selected>深色</option>
+        </select>
+      </label>
 
 
       <button id="btn-reconcile-archive" class="secondary-btn reconcile-btn" title="按规则核对本地同目录教材并执行归档：1. 同目录下同名非最新版归档至 History；2. 官网已下架教材归档至 History；3. 本地已有在用最新教材自动识别免重复下载">核对与归档</button>

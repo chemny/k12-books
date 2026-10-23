@@ -84,8 +84,6 @@ node scripts/benchmark-local-processing.js
 
 以上脚本的执行结果、教材文件及本地实验资料均不纳入仓库。
 
-## 项目来源与许可证声明
+---
 
-K12 Books 基于 [scott20201225/ChinaK12BookDownLoader](https://github.com/scott20201225/ChinaK12BookDownLoader) 修改，原作者为 **scottcheng**。原项目的 `package.json` 声明许可证为 **MIT**，本项目保留该声明及原作者署名。
-
-当前版本完善了下载稳定性、目录完整性、筛选交互、任务反馈、本地统计和批量处理性能。
+基于 [ChinaK12BookDownLoader](https://github.com/scott20201225/ChinaK12BookDownLoader)（scottcheng）修改，沿用原项目 `package.json` 中的 MIT 许可证声明。
